@@ -2,29 +2,41 @@
 S&P 500 RSI(4) Multi-Timeframe Scanner
 Detects overbought/oversold conditions and bullish/bearish divergences.
 
-Data sources supported (in order of priority):
-  1. yfinance  — requires internet access to Yahoo Finance
-  2. Alpha Vantage — set env ALPHAVANTAGE_API_KEY
-  3. --demo  flag — synthetic data for offline testing / CI environments
+Data sources (priority order):
+  1. yfinance        — Yahoo Finance, no API key needed
+  2. Alpha Vantage   — set env ALPHAVANTAGE_API_KEY
+  3. --demo          — synthetic data, no internet required
+
+Watch mode refresh schedule (--watch):
+  5min  → every 15 minutes
+  1h    → every 5 hours
+  4h    → every Friday at market open (09:30 ET)
+  1D    → every Friday at market open (09:30 ET)
 """
 
 import os
-import sys
 import argparse
 import random
+import threading
+import time
 import warnings
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
+from rich.live import Live
+from rich.panel import Panel
+from rich.columns import Columns
 from rich import box
 
 warnings.filterwarnings("ignore")
 
 console = Console()
+ET = ZoneInfo("America/New_York")
 
 # ─── S&P 500 tickers (top 100 by market cap) ─────────────────────────────────
 SP500_TICKERS = [
@@ -42,10 +54,19 @@ SP500_TICKERS = [
 
 # ─── Timeframe config ─────────────────────────────────────────────────────────
 TIMEFRAMES = {
-    "5min": {"interval": "5m",  "period": "5d",   "bars": 390},
-    "1h":   {"interval": "1h",  "period": "30d",  "bars": 200},
-    "4h":   {"interval": "1h",  "period": "60d",  "bars": 120},  # resampled
-    "1D":   {"interval": "1d",  "period": "180d", "bars": 130},
+    "5min": {"interval": "5m",  "period": "5d"},
+    "1h":   {"interval": "1h",  "period": "30d"},
+    "4h":   {"interval": "1h",  "period": "60d"},   # resampled to 4h
+    "1D":   {"interval": "1d",  "period": "180d"},
+}
+
+# Refresh schedule per timeframe
+# "weekly_friday" means: once per week, on Friday
+TF_SCHEDULE = {
+    "5min": {"type": "interval", "seconds": 15 * 60},           # every 15 min
+    "1h":   {"type": "interval", "seconds": 5 * 60 * 60},       # every 5 hours
+    "4h":   {"type": "weekly_friday"},
+    "1D":   {"type": "weekly_friday"},
 }
 
 RSI_PERIOD   = 4
@@ -81,28 +102,24 @@ def _local_extremes(arr: np.ndarray, order: int = 3):
     return highs, lows
 
 
-def detect_divergence(price: pd.Series, rsi: pd.Series, lookback: int = DIV_LOOKBACK) -> str:
+def detect_divergence(price: pd.Series, rsi: pd.Series,
+                      lookback: int = DIV_LOOKBACK) -> str:
     """
-    Bullish  : price lower low + RSI higher low  → BUY setup
-    Bearish  : price higher high + RSI lower high → SELL setup
+    Bullish : price lower low  + RSI higher low  → BUY setup
+    Bearish : price higher high + RSI lower high → SELL setup
     """
     if len(price) < lookback + 5:
         return ""
-
-    p  = price.iloc[-lookback:].values
-    r  = rsi.iloc[-lookback:].values
-
+    p = price.iloc[-lookback:].values
+    r = rsi.iloc[-lookback:].values
     ph, pl = _local_extremes(p)
     rh, rl = _local_extremes(r)
-
     if len(ph) >= 2 and len(rh) >= 2:
         if p[ph[-1]] > p[ph[-2]] and r[rh[-1]] < r[rh[-2]]:
             return "bearish"
-
     if len(pl) >= 2 and len(rl) >= 2:
         if p[pl[-1]] < p[pl[-2]] and r[rl[-1]] > r[rl[-2]]:
             return "bullish"
-
     return ""
 
 
@@ -110,15 +127,49 @@ def detect_divergence(price: pd.Series, rsi: pd.Series, lookback: int = DIV_LOOK
 # Signal resolver
 # ═════════════════════════════════════════════════════════════════════════════
 def resolve_signal(condition: str, divergence: str) -> str:
-    if condition == "oversold"    and divergence == "bullish":
-        return "🟢 BUY"
-    if condition == "overbought"  and divergence == "bearish":
-        return "🔴 SELL"
-    if condition == "oversold"    and divergence == "bearish":
-        return "⚠️  CONT ↓"
-    if condition == "overbought"  and divergence == "bullish":
-        return "⚠️  CONT ↑"
+    if condition == "oversold"   and divergence == "bullish":  return "🟢 BUY"
+    if condition == "overbought" and divergence == "bearish":  return "🔴 SELL"
+    if condition == "oversold"   and divergence == "bearish":  return "⚠️  CONT ↓"
+    if condition == "overbought" and divergence == "bullish":  return "⚠️  CONT ↑"
     return "—"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Schedule helpers
+# ═════════════════════════════════════════════════════════════════════════════
+def _next_friday_930() -> datetime:
+    """Return the next Friday 09:30 ET as UTC-aware datetime."""
+    now = datetime.now(ET)
+    days_ahead = (4 - now.weekday()) % 7   # 4 = Friday
+    if days_ahead == 0:
+        # today is Friday — if before 09:30 stay today, else next week
+        target = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        if now >= target:
+            days_ahead = 7
+    else:
+        pass
+    next_fri = now + timedelta(days=days_ahead if days_ahead else 7)
+    return next_fri.replace(hour=9, minute=30, second=0, microsecond=0)
+
+
+def _seconds_until(dt: datetime) -> float:
+    now = datetime.now(dt.tzinfo or ET)
+    return max(0.0, (dt - now).total_seconds())
+
+
+def _fmt_countdown(seconds: float) -> str:
+    if seconds <= 0:
+        return "ahora"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    if s < 86400:
+        h, rem = divmod(s, 3600)
+        return f"{h}h {rem // 60:02d}m"
+    d, rem = divmod(s, 86400)
+    return f"{d}d {rem // 3600:02d}h"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -128,7 +179,8 @@ def _resample_4h(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.index = pd.to_datetime(df.index)
     return df.resample("4h").agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+        {"Open": "first", "High": "max", "Low": "min",
+         "Close": "last", "Volume": "sum"}
     ).dropna()
 
 
@@ -147,48 +199,36 @@ def fetch_yfinance(ticker: str, interval: str, period: str) -> pd.DataFrame | No
 
 
 def fetch_alphavantage(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
-    """
-    Alpha Vantage free tier — requires ALPHAVANTAGE_API_KEY env var.
-    Maps yfinance-style intervals to AV function names.
-    """
     api_key = os.environ.get("ALPHAVANTAGE_API_KEY")
     if not api_key:
         return None
     try:
         import requests
-
         av_map = {
-            "5m":  ("TIME_SERIES_INTRADAY", "5min"),
-            "1h":  ("TIME_SERIES_INTRADAY", "60min"),
-            "1d":  ("TIME_SERIES_DAILY_ADJUSTED", None),
+            "5m": ("TIME_SERIES_INTRADAY", "5min"),
+            "1h": ("TIME_SERIES_INTRADAY", "60min"),
+            "1d": ("TIME_SERIES_DAILY_ADJUSTED", None),
         }
         if interval not in av_map:
             return None
-
         func, av_interval = av_map[interval]
         params: dict = {"function": func, "symbol": ticker, "apikey": api_key,
                         "outputsize": "full", "datatype": "json"}
         if av_interval:
             params["interval"] = av_interval
-
         r = requests.get("https://www.alphavantage.co/query", params=params, timeout=15)
         data = r.json()
-
-        # find the time series key
         ts_key = next((k for k in data if "Time Series" in k), None)
         if not ts_key:
             return None
-
         df = pd.DataFrame(data[ts_key]).T
         df.index = pd.to_datetime(df.index)
         df = df.sort_index()
         df.columns = [c.split(". ")[1].capitalize() for c in df.columns]
-        df = df.rename(columns={"Adjusted close": "Close", "Close": "Close"})
+        df = df.rename(columns={"Adjusted close": "Close"})
         for col in ["Open", "High", "Low", "Close", "Volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col])
-
-        # trim to requested period
         days = {"5d": 5, "30d": 30, "60d": 60, "180d": 180}.get(period, 30)
         cutoff = datetime.now() - timedelta(days=days)
         df = df[df.index >= cutoff]
@@ -198,174 +238,153 @@ def fetch_alphavantage(ticker: str, interval: str, period: str) -> pd.DataFrame 
 
 
 # ─── Demo / synthetic data ────────────────────────────────────────────────────
-def _synthetic_price(n: int, start: float, vol: float = 0.01,
-                     trend: float = 0.0) -> np.ndarray:
-    """Geometric Brownian Motion."""
+def _synthetic_price(n: int, start: float, vol: float = 0.01) -> np.ndarray:
     rng   = np.random.default_rng(abs(hash(str(n) + str(start))) % (2**32))
-    steps = rng.normal(trend, vol, n)
+    steps = rng.normal(0, vol, n)
     return start * np.exp(np.cumsum(steps))
 
 
-def _force_extreme(close: np.ndarray, condition: str, period: int = RSI_PERIOD) -> np.ndarray:
-    """
-    Nudge the last few bars so the RSI lands in the extreme zone.
-    condition: 'overbought' | 'oversold'
-    """
+def _force_extreme(close: np.ndarray, condition: str) -> np.ndarray:
     close = close.copy()
-    if condition == "overbought":
-        # big consecutive up candles at the end
-        for i in range(-period * 3, 0):
-            close[i] *= 1.012
-    else:
-        for i in range(-period * 3, 0):
-            close[i] *= 0.988
+    factor = 1.012 if condition == "overbought" else 0.988
+    for i in range(-RSI_PERIOD * 3, 0):
+        close[i] *= factor
     return close
 
 
-def _maybe_add_divergence(close: np.ndarray, condition: str, div_type: str) -> np.ndarray:
-    """Inject a synthetic divergence pattern in the lookback window."""
+def _inject_divergence(close: np.ndarray, condition: str, div_type: str) -> np.ndarray:
     close = close.copy()
     lb = DIV_LOOKBACK + 5
     if len(close) < lb:
         return close
-
-    # Place two swing points at roughly -lb and -lb//2
-    i1 = -lb
-    i2 = -(lb // 2)
-
+    i1, i2 = -lb, -(lb // 2)
     if div_type == "bullish" and condition == "oversold":
-        # price: lower low at i2; RSI: higher low → need price to drop more at i2
         close[i1] *= 0.985
-        close[i2] *= 0.980   # lower low in price
-        # RSI will naturally be higher at i2 because the drop was more gradual
+        close[i2] *= 0.980
     elif div_type == "bearish" and condition == "overbought":
         close[i1] *= 1.015
-        close[i2] *= 1.020   # higher high in price; RSI lower high via deceleration
-        # flatten gains just before i2 so RSI decelerates
+        close[i2] *= 1.020
         for j in range(i2 + 1, 0):
             close[j] *= 0.998
-
     return close
 
 
-def fetch_demo(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
+def fetch_demo(ticker: str, interval: str, period: str,
+               seed_offset: int = 0) -> pd.DataFrame | None:
     """
-    Generate realistic synthetic OHLCV data.
-    ~30 % of calls produce an extreme RSI condition, and half of those
-    include a divergence, to give the table interesting content.
+    Synthetic OHLCV.  seed_offset lets watch mode produce different data
+    on each refresh cycle (simulates market movement).
     """
-    n_bars = {"5m": 390, "1h": 200, "1d": 130}.get(interval, 150)
-    rng    = random.Random(hash(ticker + interval))
+    n_bars  = {"5m": 390, "1h": 200, "1d": 130}.get(interval, 150)
+    rng     = random.Random(hash(ticker + interval) + seed_offset)
+    start_p = rng.uniform(20, 800)
+    close   = _synthetic_price(n_bars, start_p)
 
-    start_price = rng.uniform(20, 800)
-    base_close  = _synthetic_price(n_bars, start_price)
-
-    # Decide what scenario this ticker+timeframe shows
     scenario = rng.random()
-    condition = None
-    div_type  = None
-
     if scenario < 0.15:
-        condition = "overbought"
-        div_type  = rng.choice(["bearish", "bullish", None, None])
-        base_close = _force_extreme(base_close, "overbought")
-        if div_type:
-            base_close = _maybe_add_divergence(base_close, condition, div_type)
+        cond  = "overbought"
+        dtype = rng.choice(["bearish", "bullish", None, None])
+        close = _force_extreme(close, cond)
+        if dtype:
+            close = _inject_divergence(close, cond, dtype)
     elif scenario < 0.30:
-        condition = "oversold"
-        div_type  = rng.choice(["bullish", "bearish", None, None])
-        base_close = _force_extreme(base_close, "oversold")
-        if div_type:
-            base_close = _maybe_add_divergence(base_close, condition, div_type)
+        cond  = "oversold"
+        dtype = rng.choice(["bullish", "bearish", None, None])
+        close = _force_extreme(close, cond)
+        if dtype:
+            close = _inject_divergence(close, cond, dtype)
 
-    # Build OHLCV frame
-    spread = np.abs(np.diff(base_close, prepend=base_close[0])) * 0.5 + start_price * 0.002
-    high   = base_close + spread
-    low    = base_close - spread
-    open_  = np.roll(base_close, 1)
-    open_[0] = base_close[0]
-    volume = np.abs(np.random.default_rng(42).normal(1_000_000, 300_000, n_bars)).astype(int)
+    spread   = np.abs(np.diff(close, prepend=close[0])) * 0.5 + start_p * 0.002
+    open_    = np.roll(close, 1); open_[0] = close[0]
+    volume   = np.abs(
+        np.random.default_rng(42).normal(1_000_000, 300_000, n_bars)
+    ).astype(int)
 
-    freq_map = {"5m": "5min", "1h": "h", "1d": "D"}
-    freq     = freq_map.get(interval, "h")
-    idx      = pd.date_range(end=datetime.now(), periods=n_bars, freq=freq)
+    freq = {"5m": "5min", "1h": "h", "1d": "D"}.get(interval, "h")
+    idx  = pd.date_range(end=datetime.now(), periods=n_bars, freq=freq)
 
-    df = pd.DataFrame({
-        "Open":   open_, "High": high, "Low": low,
-        "Close":  base_close, "Volume": volume,
+    return pd.DataFrame({
+        "Open": open_, "High": close + spread, "Low": close - spread,
+        "Close": close, "Volume": volume,
     }, index=idx)
 
-    return df
 
-
-# ─── Unified fetch ────────────────────────────────────────────────────────────
 def fetch_ohlcv(ticker: str, interval: str, period: str,
-                use_demo: bool = False) -> pd.DataFrame | None:
+                use_demo: bool = False, seed_offset: int = 0) -> pd.DataFrame | None:
     if use_demo:
-        return fetch_demo(ticker, interval, period)
-
+        return fetch_demo(ticker, interval, period, seed_offset)
     df = fetch_yfinance(ticker, interval, period)
     if df is not None:
         return df
-
-    df = fetch_alphavantage(ticker, interval, period)
-    return df
+    return fetch_alphavantage(ticker, interval, period)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Ticker scanner
+# Per-timeframe scanner
 # ═════════════════════════════════════════════════════════════════════════════
-def scan_ticker(ticker: str, use_demo: bool = False) -> dict | None:
+def scan_timeframe(tickers: list[str], tf_name: str,
+                   use_demo: bool = False, seed_offset: int = 0) -> dict:
+    """Returns {ticker: {rsi, condition, divergence}} for one timeframe."""
+    cfg     = TIMEFRAMES[tf_name]
     results = {}
-
-    for tf_name, cfg in TIMEFRAMES.items():
-        df = fetch_ohlcv(ticker, cfg["interval"], cfg["period"], use_demo)
+    for ticker in tickers:
+        df = fetch_ohlcv(ticker, cfg["interval"], cfg["period"],
+                         use_demo, seed_offset)
         if df is None:
             continue
-
         if tf_name == "4h":
             df = _resample_4h(df)
-
         if len(df) < RSI_PERIOD + 10:
             continue
-
         close = df["Close"].squeeze()
         rsi   = calc_rsi(close)
         last  = float(rsi.iloc[-1])
-
         if np.isnan(last):
             continue
-
         if last >= OVERBOUGHT:
-            condition = "overbought"
+            cond = "overbought"
         elif last <= OVERSOLD:
-            condition = "oversold"
+            cond = "oversold"
         else:
             continue
-
-        div = detect_divergence(close, rsi)
-        results[tf_name] = {
+        results[ticker] = {
             "rsi":       round(last, 1),
-            "condition": condition,
-            "divergence": div,
+            "condition": cond,
+            "divergence": detect_divergence(close, rsi),
         }
+    return results
 
-    return results if results else None
+
+def full_scan(tickers: list[str], use_demo: bool = False,
+              seed_offset: int = 0) -> dict:
+    """
+    Returns {ticker: {tf_name: {rsi, condition, divergence}}} for ALL timeframes.
+    Only tickers with at least one extreme condition are included.
+    """
+    tf_results: dict[str, dict] = {}
+    for tf_name in TIMEFRAMES:
+        tf_results[tf_name] = scan_timeframe(tickers, tf_name,
+                                             use_demo, seed_offset)
+
+    scan_data: dict = {}
+    for tf_name, by_ticker in tf_results.items():
+        for ticker, info in by_ticker.items():
+            scan_data.setdefault(ticker, {})[tf_name] = info
+
+    return scan_data
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Rendering
+# Rendering helpers
 # ═════════════════════════════════════════════════════════════════════════════
 def _cell(info: dict) -> Text:
-    rsi_val  = info["rsi"]
-    cond     = info["condition"]
-    div      = info["divergence"]
-    signal   = resolve_signal(cond, div)
-
-    color    = "red" if cond == "overbought" else "green"
-    icon     = "🔺" if cond == "overbought" else "🔻"
-
-    cell = Text()
+    rsi_val = info["rsi"]
+    cond    = info["condition"]
+    div     = info["divergence"]
+    signal  = resolve_signal(cond, div)
+    color   = "red" if cond == "overbought" else "green"
+    icon    = "🔺" if cond == "overbought" else "🔻"
+    cell    = Text()
     cell.append(f"RSI {rsi_val} {icon}", style=f"bold {color}")
     if div == "bullish":
         cell.append("  ↑div", style="bold green")
@@ -375,15 +394,19 @@ def _cell(info: dict) -> Text:
     return cell
 
 
-def render_table(scan_data: dict, demo: bool = False):
-    tf_cols = list(TIMEFRAMES.keys())
+def build_table(scan_data: dict, last_refresh: dict[str, datetime],
+                next_refresh: dict[str, datetime],
+                status: str = "", demo: bool = False) -> Table:
+    tf_cols  = list(TIMEFRAMES.keys())
+    now      = datetime.now(ET)
     mode_tag = "  [dim yellow][DEMO][/dim yellow]" if demo else ""
 
     table = Table(
         title=(
             f"[bold cyan]S&P 500 · RSI({RSI_PERIOD}) Scanner[/bold cyan]"
             f"{mode_tag}  "
-            f"[dim]{datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}[/dim]"
+            f"[dim]{now.strftime('%Y-%m-%d  %H:%M:%S ET')}[/dim]"
+            + (f"  [dim]{status}[/dim]" if status else "")
         ),
         box=box.SIMPLE_HEAD,
         show_lines=True,
@@ -392,111 +415,254 @@ def render_table(scan_data: dict, demo: bool = False):
 
     table.add_column("Ticker", style="bold white", width=8)
     for tf in tf_cols:
-        table.add_column(tf, justify="center", width=22)
+        last  = last_refresh.get(tf)
+        nxt   = next_refresh.get(tf)
+        sched = TF_SCHEDULE[tf]
 
-    for ticker, tf_data in sorted(scan_data.items()):
-        row: list = [ticker]
-        for tf in tf_cols:
-            if tf not in tf_data:
-                row.append(Text("·", style="dim"))
-            else:
-                row.append(_cell(tf_data[tf]))
-        table.add_row(*row)
+        if sched["type"] == "weekly_friday":
+            cadence = "viernes"
+        else:
+            mins = sched["seconds"] // 60
+            cadence = f"/{mins}min" if mins < 60 else f"/{mins//60}h"
 
-    console.print(table)
+        refresh_info = ""
+        if last:
+            refresh_info += f"[dim]↺ {last.strftime('%H:%M')}[/dim]"
+        if nxt:
+            secs_left = _seconds_until(nxt)
+            refresh_info += f"  [dim cyan]→ {_fmt_countdown(secs_left)}[/dim cyan]"
+
+        header = f"[bold]{tf}[/bold] [dim]{cadence}[/dim]\n{refresh_info}"
+        table.add_column(header, justify="center", width=24)
+
+    if not scan_data:
+        table.add_row(
+            "[dim]—[/dim]",
+            *["[dim]sin señales activas[/dim]"] * len(tf_cols)
+        )
+    else:
+        for ticker, tf_data in sorted(scan_data.items()):
+            row: list = [ticker]
+            for tf in tf_cols:
+                if tf not in tf_data:
+                    row.append(Text("·", style="dim"))
+                else:
+                    row.append(_cell(tf_data[tf]))
+            table.add_row(*row)
+
+    return table
 
 
-def print_legend():
-    console.print(
-        "\n[bold]Leyenda[/bold]\n"
-        "  🔺 Sobrecompra RSI ≥ [bold red]80[/bold red]   "
-        "🔻 Sobreventa RSI ≤ [bold green]20[/bold green]\n"
-        "  [bold green]↑div[/bold green] divergencia alcista (precio LL · RSI HL)   "
-        "[bold red]↓div[/bold red] divergencia bajista (precio HH · RSI LH)\n"
-        "  🟢 BUY  = sobreventa + div alcista   "
-        "🔴 SELL = sobrecompra + div bajista\n"
-        "  ⚠️  CONT = divergencia confirma tendencia (señal de continuación)\n"
-    )
+def build_legend() -> Text:
+    t = Text()
+    t.append("Leyenda  ", style="bold")
+    t.append("🔺 Sobrecompra ≥80  🔻 Sobreventa ≤20  ")
+    t.append("↑div", style="bold green")
+    t.append(" div alcista  ")
+    t.append("↓div", style="bold red")
+    t.append(" div bajista  ")
+    t.append("🟢 BUY", style="bold green")
+    t.append(" sob.venta+alcista  ")
+    t.append("🔴 SELL", style="bold red")
+    t.append(" sob.compra+bajista")
+    return t
 
 
-def print_summary(scan_data: dict):
-    buy_s  = sell_s = 0
+def build_summary(scan_data: dict) -> Text:
+    buy_s = sell_s = 0
     for td in scan_data.values():
         for info in td.values():
             sig = resolve_signal(info["condition"], info["divergence"])
-            if sig == "🟢 BUY":
-                buy_s += 1
-            elif sig == "🔴 SELL":
-                sell_s += 1
+            if sig == "🟢 BUY":   buy_s  += 1
+            elif sig == "🔴 SELL": sell_s += 1
+    t = Text()
+    t.append("Señales activas: ", style="bold")
+    t.append(str(len(scan_data)), style="cyan")
+    t.append("  BUY: ", style="bold")
+    t.append(str(buy_s),  style="bold green")
+    t.append("  SELL: ", style="bold")
+    t.append(str(sell_s), style="bold red")
+    return t
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Watch mode
+# ═════════════════════════════════════════════════════════════════════════════
+class WatchState:
+    """Shared mutable state between the scheduler threads and the render loop."""
+
+    def __init__(self, tickers: list[str], use_demo: bool):
+        self.tickers   = tickers
+        self.use_demo  = use_demo
+        self.lock      = threading.Lock()
+
+        # scan_data[ticker][tf] = {rsi, condition, divergence}
+        self.scan_data: dict = {}
+
+        # per-timeframe timestamps
+        self.last_refresh: dict[str, datetime] = {}
+        self.next_refresh: dict[str, datetime] = {}
+
+        self.status      = "iniciando…"
+        self.seed_offset = 0   # incremented on each demo refresh
+
+        # Compute initial "next refresh" for each timeframe
+        now = datetime.now(ET)
+        for tf_name, sched in TF_SCHEDULE.items():
+            if sched["type"] == "interval":
+                self.next_refresh[tf_name] = now + timedelta(seconds=sched["seconds"])
+            else:
+                self.next_refresh[tf_name] = _next_friday_930()
+
+    def refresh_tf(self, tf_name: str):
+        with self.lock:
+            self.status = f"actualizando {tf_name}…"
+
+        new_tf_data = scan_timeframe(
+            self.tickers, tf_name,
+            self.use_demo, self.seed_offset
+        )
+
+        now = datetime.now(ET)
+        sched = TF_SCHEDULE[tf_name]
+
+        with self.lock:
+            # Merge: remove old data for this tf, add new
+            for ticker in list(self.scan_data.keys()):
+                self.scan_data[ticker].pop(tf_name, None)
+                if not self.scan_data[ticker]:
+                    del self.scan_data[ticker]
+
+            for ticker, info in new_tf_data.items():
+                self.scan_data.setdefault(ticker, {})[tf_name] = info
+
+            self.last_refresh[tf_name] = now
+            if sched["type"] == "interval":
+                self.next_refresh[tf_name] = now + timedelta(seconds=sched["seconds"])
+            else:
+                self.next_refresh[tf_name] = _next_friday_930()
+
+            self.seed_offset += 1
+            self.status = ""
+
+
+def _tf_worker(tf_name: str, state: WatchState, stop_event: threading.Event):
+    """Background thread: refreshes one timeframe on its schedule."""
+    # Initial scan immediately
+    state.refresh_tf(tf_name)
+
+    sched = TF_SCHEDULE[tf_name]
+
+    while not stop_event.is_set():
+        with state.lock:
+            nxt = state.next_refresh.get(tf_name)
+
+        secs = _seconds_until(nxt) if nxt else 60
+        # Sleep in small chunks so we can react to stop_event quickly
+        chunk = min(secs, 10.0)
+        while chunk > 0 and not stop_event.is_set():
+            time.sleep(min(chunk, 1.0))
+            chunk -= 1.0
+            with state.lock:
+                nxt = state.next_refresh.get(tf_name)
+            remaining = _seconds_until(nxt) if nxt else 0
+            if remaining <= 0:
+                break
+
+        if stop_event.is_set():
+            break
+
+        state.refresh_tf(tf_name)
+
+
+def run_watch(tickers: list[str], use_demo: bool):
+    state      = WatchState(tickers, use_demo)
+    stop_event = threading.Event()
+
+    # Launch one background thread per timeframe
+    threads = []
+    for tf_name in TIMEFRAMES:
+        t = threading.Thread(
+            target=_tf_worker,
+            args=(tf_name, state, stop_event),
+            daemon=True,
+            name=f"tf-{tf_name}",
+        )
+        t.start()
+        threads.append(t)
+
+    try:
+        with Live(console=console, refresh_per_second=1, screen=True) as live:
+            while True:
+                with state.lock:
+                    scan_data    = dict(state.scan_data)
+                    last_refresh = dict(state.last_refresh)
+                    next_refresh = dict(state.next_refresh)
+                    status       = state.status
+
+                table   = build_table(scan_data, last_refresh, next_refresh,
+                                      status=status, demo=use_demo)
+                legend  = build_legend()
+                summary = build_summary(scan_data)
+
+                help_text = Text(
+                    "\n  Ctrl+C para salir", style="dim"
+                )
+
+                live.update(
+                    Panel(
+                        Columns([table]),
+                        subtitle=Text.assemble(legend, "\n", summary, help_text),
+                        border_style="dim cyan",
+                        padding=(0, 1),
+                    )
+                )
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        console.print("\n[dim]Scanner detenido.[/dim]")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# One-shot scan (no watch)
+# ═════════════════════════════════════════════════════════════════════════════
+def run_once(tickers: list[str], use_demo: bool):
     console.print(
-        f"[bold]Resumen[/bold]  "
-        f"Acciones con señal activa: [cyan]{len(scan_data)}[/cyan]  |  "
-        f"[bold green]BUY: {buy_s}[/bold green]  |  "
-        f"[bold red]SELL: {sell_s}[/bold red]\n"
+        f"\n[bold cyan]Escaneando {len(tickers)} acciones del S&P 500…[/bold cyan]\n"
+        f"RSI({RSI_PERIOD})  Sobrecompra≥[bold red]{OVERBOUGHT}[/bold red]  "
+        f"Sobreventa≤[bold green]{OVERSOLD}[/bold green]  "
+        f"Timeframes: [italic]{', '.join(TIMEFRAMES)}[/italic]\n"
     )
+
+    total = len(tickers)
+    for i, t in enumerate(tickers, 1):
+        console.print(f"[dim]({i:>3}/{total}) {t:<8}[/dim]", end="\r")
+
+    scan_data = full_scan(tickers, use_demo)
+    console.print(" " * 60, end="\r")
+
+    if not scan_data:
+        console.print("[yellow]No hay señales activas en este momento.[/yellow]")
+        return
+
+    now = datetime.now(ET)
+    empty_ts: dict = {}
+    table = build_table(scan_data, empty_ts, empty_ts, demo=use_demo)
+    console.print(table)
+
+    console.print()
+    console.print(build_legend())
+    console.print()
+    console.print(build_summary(scan_data))
+    console.print()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Main
 # ═════════════════════════════════════════════════════════════════════════════
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="S&P 500 RSI(4) multi-timeframe scanner with divergence detection."
-    )
-    p.add_argument("--demo",    action="store_true",
-                   help="Use synthetic data (no internet required).")
-    p.add_argument("--tickers", nargs="+", default=None,
-                   help="Scan specific tickers only, e.g. --tickers AAPL MSFT NVDA")
-    p.add_argument("--top",     type=int, default=None,
-                   help="Scan only first N tickers from the list (e.g. --top 20).")
-    return p.parse_args()
-
-
-def main():
-    args    = parse_args()
-    tickers = args.tickers or (
-        SP500_TICKERS[:args.top] if args.top else SP500_TICKERS
-    )
-    demo    = args.demo or not _yfinance_available()
-
-    if demo and not args.demo:
-        console.print(
-            "[yellow]⚠  yfinance / Alpha Vantage no disponible — "
-            "usando datos sintéticos (--demo).[/yellow]\n"
-        )
-
-    console.print(
-        f"\n[bold cyan]Escaneando {len(tickers)} acciones del S&P 500…[/bold cyan]\n"
-        f"RSI period=[bold]{RSI_PERIOD}[/bold]  "
-        f"Sobrecompra≥[bold red]{OVERBOUGHT}[/bold red]  "
-        f"Sobreventa≤[bold green]{OVERSOLD}[/bold green]  "
-        f"Timeframes: [italic]{', '.join(TIMEFRAMES)}[/italic]\n"
-    )
-
-    scan_data: dict = {}
-    total = len(tickers)
-
-    for i, ticker in enumerate(tickers, 1):
-        console.print(f"[dim]({i:>3}/{total}) {ticker:<8}[/dim]", end="\r")
-        result = scan_ticker(ticker, use_demo=demo)
-        if result:
-            scan_data[ticker] = result
-
-    console.print(" " * 60, end="\r")
-
-    if not scan_data:
-        console.print(
-            "[yellow]No se encontraron acciones en condición extrema "
-            "en este momento.[/yellow]"
-        )
-        return
-
-    render_table(scan_data, demo=demo)
-    print_legend()
-    print_summary(scan_data)
-
-
 def _yfinance_available() -> bool:
     try:
         import yfinance as yf
@@ -505,6 +671,51 @@ def _yfinance_available() -> bool:
         return df is not None and not df.empty
     except Exception:
         return False
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="S&P 500 RSI(4) multi-timeframe scanner with divergence detection."
+    )
+    p.add_argument("--watch",   action="store_true",
+                   help="Live mode: auto-refresh each timeframe on its schedule.")
+    p.add_argument("--demo",    action="store_true",
+                   help="Use synthetic data (no internet required).")
+    p.add_argument("--tickers", nargs="+", default=None,
+                   help="Specific tickers, e.g. --tickers AAPL MSFT NVDA TSLA AMZN")
+    p.add_argument("--top",     type=int, default=None,
+                   help="Scan first N tickers from the built-in list.")
+    return p.parse_args()
+
+
+def main():
+    args    = parse_args()
+    tickers = args.tickers or (
+        SP500_TICKERS[:args.top] if args.top else SP500_TICKERS
+    )
+    demo = args.demo or not _yfinance_available()
+
+    if demo and not args.demo:
+        console.print(
+            "[yellow]⚠  yfinance / Alpha Vantage no disponible — "
+            "usando datos sintéticos (--demo).[/yellow]\n"
+        )
+
+    if args.watch:
+        # Print schedule info before entering live screen
+        console.print(
+            f"\n[bold cyan]Watch mode — {len(tickers)} acciones[/bold cyan]\n"
+            f"  [bold]5min[/bold] → refresco cada [cyan]15 minutos[/cyan]\n"
+            f"  [bold]1h[/bold]   → refresco cada [cyan]5 horas[/cyan]\n"
+            f"  [bold]4h[/bold]   → refresco cada [cyan]viernes 09:30 ET[/cyan]  "
+            f"(próximo: {_next_friday_930().strftime('%Y-%m-%d')})\n"
+            f"  [bold]1D[/bold]   → refresco cada [cyan]viernes 09:30 ET[/cyan]  "
+            f"(próximo: {_next_friday_930().strftime('%Y-%m-%d')})\n"
+        )
+        time.sleep(1.5)
+        run_watch(tickers, demo)
+    else:
+        run_once(tickers, demo)
 
 
 if __name__ == "__main__":
