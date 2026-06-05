@@ -38,6 +38,12 @@ warnings.filterwarnings("ignore")
 console = Console()
 ET = ZoneInfo("America/New_York")
 
+# Default tickers for quick scans (used when no --tickers / --top given)
+DEFAULT_TICKERS = [
+    "AAPL","MSFT","NVDA","TSLA","AMZN",
+    "GOOGL","META","JPM","NFLX","AMD",
+]
+
 # ─── S&P 500 tickers (top 100 by market cap) ─────────────────────────────────
 SP500_TICKERS = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","AVGO",
@@ -346,11 +352,11 @@ def scan_timeframe(tickers: list[str], tf_name: str,
         elif last <= OVERSOLD:
             cond = "oversold"
         else:
-            continue
+            cond = ""
         results[ticker] = {
             "rsi":       round(last, 1),
             "condition": cond,
-            "divergence": detect_divergence(close, rsi),
+            "divergence": detect_divergence(close, rsi) if cond else "",
         }
     return results
 
@@ -381,16 +387,19 @@ def _cell(info: dict) -> Text:
     rsi_val = info["rsi"]
     cond    = info["condition"]
     div     = info["divergence"]
-    signal  = resolve_signal(cond, div)
-    color   = "red" if cond == "overbought" else "green"
-    icon    = "🔺" if cond == "overbought" else "🔻"
     cell    = Text()
-    cell.append(f"RSI {rsi_val} {icon}", style=f"bold {color}")
-    if div == "bullish":
-        cell.append("  ↑div", style="bold green")
-    elif div == "bearish":
-        cell.append("  ↓div", style="bold red")
-    cell.append(f"\n{signal}")
+    if cond:
+        signal = resolve_signal(cond, div)
+        color  = "red" if cond == "overbought" else "green"
+        icon   = "🔺" if cond == "overbought" else "🔻"
+        cell.append(f"RSI {rsi_val} {icon}", style=f"bold {color}")
+        if div == "bullish":
+            cell.append("  ↑div", style="bold green")
+        elif div == "bearish":
+            cell.append("  ↓div", style="bold red")
+        cell.append(f"\n{signal}")
+    else:
+        cell.append(f"RSI {rsi_val}", style="dim")
     return cell
 
 
@@ -438,7 +447,7 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
     if not scan_data:
         table.add_row(
             "[dim]—[/dim]",
-            *["[dim]sin señales activas[/dim]"] * len(tf_cols)
+            *["[dim]sin datos[/dim]"] * len(tf_cols)
         )
     else:
         for ticker, tf_data in sorted(scan_data.items()):
@@ -469,15 +478,20 @@ def build_legend() -> Text:
 
 
 def build_summary(scan_data: dict) -> Text:
-    buy_s = sell_s = 0
+    buy_s = sell_s = active = 0
     for td in scan_data.values():
+        has_extreme = False
         for info in td.values():
-            sig = resolve_signal(info["condition"], info["divergence"])
-            if sig == "🟢 BUY":   buy_s  += 1
-            elif sig == "🔴 SELL": sell_s += 1
+            if info["condition"]:
+                has_extreme = True
+                sig = resolve_signal(info["condition"], info["divergence"])
+                if sig == "🟢 BUY":   buy_s  += 1
+                elif sig == "🔴 SELL": sell_s += 1
+        if has_extreme:
+            active += 1
     t = Text()
     t.append("Señales activas: ", style="bold")
-    t.append(str(len(scan_data)), style="cyan")
+    t.append(str(active), style="cyan")
     t.append("  BUY: ", style="bold")
     t.append(str(buy_s),  style="bold green")
     t.append("  SELL: ", style="bold")
@@ -691,7 +705,7 @@ def parse_args():
 def main():
     args    = parse_args()
     tickers = args.tickers or (
-        SP500_TICKERS[:args.top] if args.top else SP500_TICKERS
+        SP500_TICKERS[:args.top] if args.top else DEFAULT_TICKERS
     )
     demo = args.demo or not _yfinance_available()
 
