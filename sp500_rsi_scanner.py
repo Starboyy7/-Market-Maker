@@ -68,10 +68,13 @@ TF_SCHEDULE = {
     "4h":   {"type": "interval", "seconds": 4 * 60 * 60},       # every 4 hours
 }
 
-RSI_PERIOD   = 4
+RSI_PERIOD   = 4   # default (used for display label)
 OVERBOUGHT   = 80
 OVERSOLD     = 20
 DIV_LOOKBACK = 20
+
+# RSI period per timeframe — entry sensitive, context selective
+RSI_PERIODS = {"5min": 4, "1h": 7, "4h": 14}
 
 # Relative volume thresholds — signal requires vol_ratio >= threshold
 VOL_THRESHOLDS: dict[str, float] = {
@@ -437,10 +440,11 @@ def scan_timeframe(tickers: list[str], tf_name: str,
             df = _resample_4h(df)
         if len(df) < RSI_PERIOD + 10:
             continue
-        vol_ratio = calc_rel_volume(df)
-        close = df["Close"].squeeze()
-        rsi   = calc_rsi(close)
-        last  = float(rsi.iloc[-1])
+        vol_ratio  = calc_rel_volume(df)
+        close      = df["Close"].squeeze()
+        rsi_period = RSI_PERIODS.get(tf_name, RSI_PERIOD)
+        rsi        = calc_rsi(close, rsi_period)
+        last       = float(rsi.iloc[-1])
         if np.isnan(last):
             continue
         if last >= OVERBOUGHT:
@@ -527,7 +531,7 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
 
     table = Table(
         title=(
-            f"[bold cyan]S&P 500 · RSI({RSI_PERIOD}) Scanner[/bold cyan]"
+            f"[bold cyan]S&P 500 · RSI(4/7/14) Scanner[/bold cyan]"
             f"{mode_tag}  "
             f"[dim]{now.strftime('%Y-%m-%d  %H:%M:%S ET')}[/dim]"
             + (f"  [dim]{status}[/dim]" if status else "")
@@ -554,7 +558,8 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
             secs_left = _seconds_until(nxt)
             refresh_info += f"  [dim cyan]→ {_fmt_countdown(secs_left)}[/dim cyan]"
 
-        header = f"[bold]{tf}[/bold] [dim]{cadence}[/dim]\n{refresh_info}"
+        rsi_p  = RSI_PERIODS.get(tf, RSI_PERIOD)
+        header = f"[bold]{tf}[/bold] [dim]{cadence} RSI({rsi_p})[/dim]\n{refresh_info}"
         table.add_column(header, justify="center", width=24)
 
     if not scan_data:
