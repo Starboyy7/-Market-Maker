@@ -80,6 +80,9 @@ VOL_THRESHOLDS: dict[str, float] = {
 }
 VOL_THRESHOLD_DEFAULT = 1.5
 
+# Slope lookback per timeframe (candles)
+SLOPE_LOOKBACK = {"5min": 5, "1h": 8, "4h": 10}
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # RSI
@@ -143,8 +146,11 @@ def resolve_signal(condition: str, divergence: str) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 # Relative volume
 # ═════════════════════════════════════════════════════════════════════════════
-def calc_rel_volume(df: pd.DataFrame) -> float:
-    """Current bar volume / average volume of the previous 20 bars."""
+def calc_rel_volume(df: pd.DataFrame) -> float | None:
+    """Current bar volume / average volume of the previous 20 bars.
+    Returns None when market is closed — volume data is not meaningful."""
+    if not _market_open():
+        return None
     if df is None or "Volume" not in df.columns or len(df) < 2:
         return 0.0
     vol = df["Volume"].dropna().astype(float)
@@ -163,10 +169,10 @@ def calc_rel_volume(df: pd.DataFrame) -> float:
 def calc_slope(close: pd.Series, lookback: int = 5) -> str:
     """
     Net % change over last `lookback` candles.
+    Lookback is TF-adaptive: 5 (5min) / 8 (1h) / 10 (4h).
     ↑↑ = net positive  (> +0.3%)
     ↓↓ = net negative  (< -0.3%)
     →  = lateral       (within ±0.3%)
-    Using net change avoids single-candle pauses masking a sustained trend.
     """
     if len(close) < lookback + 1:
         return ""
@@ -447,7 +453,7 @@ def scan_timeframe(tickers: list[str], tf_name: str,
             "rsi":       round(last, 1),
             "condition": cond,
             "divergence": detect_divergence(close, rsi) if cond else "",
-            "slope":     calc_slope(close),
+            "slope":     calc_slope(close, SLOPE_LOOKBACK.get(tf_name, 5)),
             "vol_ratio": vol_ratio,
         }
     return results
@@ -475,8 +481,11 @@ def full_scan(tickers: list[str], use_demo: bool = False,
 # ═════════════════════════════════════════════════════════════════════════════
 # Rendering helpers
 # ═════════════════════════════════════════════════════════════════════════════
-def _vol_text(vol_ratio: float) -> Text:
+def _vol_text(vol_ratio: float | None) -> Text:
     t = Text()
+    if vol_ratio is None:
+        t.append(" VOL:--", style="dim")
+        return t
     if vol_ratio <= 0:
         return t
     label = "ALTO" if vol_ratio >= 1.3 else "BAJO"
@@ -581,7 +590,7 @@ def build_legend() -> Text:
     return t
 
 
-def build_summary(scan_data: dict) -> Text:
+def build_summary(scan_data: dict, demo: bool = False) -> Text:
     buy_s = sell_s = active = 0
     for td in scan_data.values():
         has_extreme = False
@@ -602,6 +611,8 @@ def build_summary(scan_data: dict) -> Text:
     t.append(str(buy_s),  style="bold green")
     t.append("  SELL: ", style="bold")
     t.append(str(sell_s), style="bold red")
+    if demo:
+        t.append("  [DEMO]", style="bold red")
     return t
 
 
@@ -717,7 +728,7 @@ def run_watch(tickers: list[str], use_demo: bool):
                 table   = build_table(scan_data, last_refresh, next_refresh,
                                       status=status, demo=use_demo)
                 legend  = build_legend()
-                summary = build_summary(scan_data)
+                summary = build_summary(scan_data, demo=use_demo)
 
                 help_text = Text(
                     "\n  Ctrl+C para salir", style="dim"
@@ -770,7 +781,7 @@ def run_once(tickers: list[str], use_demo: bool):
     console.print()
     console.print(build_legend())
     console.print()
-    console.print(build_summary(scan_data))
+    console.print(build_summary(scan_data, demo=use_demo))
     console.print()
 
 
