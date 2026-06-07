@@ -75,6 +75,13 @@ OVERBOUGHT   = 80
 OVERSOLD     = 20
 DIV_LOOKBACK = 20
 
+# Relative volume thresholds — signal requires vol_ratio >= threshold
+VOL_THRESHOLDS: dict[str, float] = {
+    "NVDA": 1.3, "TSLA": 1.3,
+    "AAPL": 1.5, "AMZN": 1.5, "AMD": 1.5,
+}
+VOL_THRESHOLD_DEFAULT = 1.5
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # RSI
@@ -136,6 +143,23 @@ def resolve_signal(condition: str, divergence: str) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Relative volume
+# ═════════════════════════════════════════════════════════════════════════════
+def calc_rel_volume(df: pd.DataFrame) -> float:
+    """Current bar volume / average volume of the previous 20 bars."""
+    if df is None or "Volume" not in df.columns or len(df) < 2:
+        return 0.0
+    vol = df["Volume"].dropna().astype(float)
+    if len(vol) < 2:
+        return 0.0
+    current  = vol.iloc[-1]
+    avg20    = vol.iloc[-21:-1].mean() if len(vol) >= 21 else vol.iloc[:-1].mean()
+    if avg20 == 0:
+        return 0.0
+    return round(current / avg20, 2)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Price slope
 # ═════════════════════════════════════════════════════════════════════════════
 def calc_slope(close: pd.Series) -> str:
@@ -162,12 +186,12 @@ def calc_slope(close: pd.Series) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 # Multi-TF alignment signal
 # ═════════════════════════════════════════════════════════════════════════════
-def calc_alignment(tf_data: dict) -> Text:
+def calc_alignment(ticker: str, tf_data: dict) -> Text:
     """
     Priority order:
-      1. BLOQ  — divergence active in any TF (noise filter)
-      2. LONG  — 4H > 55  AND 1H > 55  AND 5M ≤ 35  (entry from oversold)
-      3. SHORT — 4H < 45  AND 1H < 45  AND 5M ≥ 65  (entry from overbought)
+      1. BLOQ    — divergence active in any TF (noise filter)
+      2. LONG    — 4H>55 AND 1H>55 AND 5M≤35 AND vol≥threshold
+      3. SHORT   — 4H<45 AND 1H<45 AND 5M≥65 AND vol≥threshold
       4. NEUTRAL — contradicting TFs
       5. ESPERAR — no clear setup yet
     """
@@ -186,17 +210,20 @@ def calc_alignment(tf_data: dict) -> Text:
                 t.append("BLOQ ↑div", style="bold green")
             return t
 
-    rsi_5m = tf_data.get("5min", {}).get("rsi")
-    rsi_1h = tf_data.get("1h",   {}).get("rsi")
-    rsi_4h = tf_data.get("4h",   {}).get("rsi")
+    rsi_5m    = tf_data.get("5min", {}).get("rsi")
+    rsi_1h    = tf_data.get("1h",   {}).get("rsi")
+    rsi_4h    = tf_data.get("4h",   {}).get("rsi")
+    vol_5m    = tf_data.get("5min", {}).get("vol_ratio", 0.0)
+    threshold = VOL_THRESHOLDS.get(ticker, VOL_THRESHOLD_DEFAULT)
 
     if None in (rsi_5m, rsi_1h, rsi_4h):
         return Text("—", style="dim")
 
+    vol_ok = vol_5m >= threshold
     t = Text()
-    if rsi_4h > 55 and rsi_1h > 55 and rsi_5m <= 35:
+    if rsi_4h > 55 and rsi_1h > 55 and rsi_5m <= 35 and vol_ok:
         t.append("LONG", style="bold green")
-    elif rsi_4h < 45 and rsi_1h < 45 and rsi_5m >= 65:
+    elif rsi_4h < 45 and rsi_1h < 45 and rsi_5m >= 65 and vol_ok:
         t.append("SHORT", style="bold red")
     elif max(rsi_4h, rsi_1h, rsi_5m) > 55 and min(rsi_4h, rsi_1h, rsi_5m) < 45:
         t.append("NEUTRAL", style="dim white")
@@ -407,6 +434,7 @@ def scan_timeframe(tickers: list[str], tf_name: str,
             df = _resample_4h(df)
         if len(df) < RSI_PERIOD + 10:
             continue
+        vol_ratio = calc_rel_volume(df)
         close = df["Close"].squeeze()
         rsi   = calc_rsi(close)
         last  = float(rsi.iloc[-1])
@@ -423,6 +451,7 @@ def scan_timeframe(tickers: list[str], tf_name: str,
             "condition": cond,
             "divergence": detect_divergence(close, rsi) if cond else "",
             "slope":     calc_slope(close),
+            "vol_ratio": vol_ratio,
         }
     return results
 
@@ -449,12 +478,23 @@ def full_scan(tickers: list[str], use_demo: bool = False,
 # ═════════════════════════════════════════════════════════════════════════════
 # Rendering helpers
 # ═════════════════════════════════════════════════════════════════════════════
+def _vol_text(vol_ratio: float) -> Text:
+    t = Text()
+    if vol_ratio <= 0:
+        return t
+    label = "ALTO" if vol_ratio >= 1.3 else "BAJO"
+    color = "cyan" if vol_ratio >= 1.3 else "dim"
+    t.append(f" VOL:{vol_ratio}× {label}", style=color)
+    return t
+
+
 def _cell(info: dict) -> Text:
-    rsi_val = info["rsi"]
-    cond    = info["condition"]
-    div     = info["divergence"]
-    slope   = info.get("slope", "")
-    cell    = Text()
+    rsi_val   = info["rsi"]
+    cond      = info["condition"]
+    div       = info["divergence"]
+    slope     = info.get("slope", "")
+    vol_ratio = info.get("vol_ratio", 0.0)
+    cell      = Text()
     if cond:
         signal = resolve_signal(cond, div)
         color  = "red" if cond == "overbought" else "green"
@@ -464,9 +504,11 @@ def _cell(info: dict) -> Text:
             cell.append("  ↑div", style="bold green")
         elif div == "bearish":
             cell.append("  ↓div", style="bold red")
+        cell.append_text(_vol_text(vol_ratio))
         cell.append(f"\n{signal}")
     else:
         cell.append(f"RSI {rsi_val} {slope}", style="dim")
+        cell.append_text(_vol_text(vol_ratio))
     return cell
 
 
@@ -519,7 +561,7 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
         )
     else:
         for ticker, tf_data in sorted(scan_data.items()):
-            row: list = [ticker, calc_alignment(tf_data)]
+            row: list = [ticker, calc_alignment(ticker, tf_data)]
             for tf in tf_cols:
                 if tf not in tf_data:
                     row.append(Text("·", style="dim"))
