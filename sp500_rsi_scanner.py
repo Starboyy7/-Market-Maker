@@ -20,7 +20,7 @@ import random
 import threading
 import time
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -222,9 +222,15 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
     vol_ok = vol_5m >= threshold
     t = Text()
     if rsi_4h > 55 and rsi_1h > 55 and rsi_5m <= 35 and vol_ok:
-        t.append("LONG", style="bold green")
+        if _market_open():
+            t.append("LONG", style="bold green")
+        else:
+            t.append("ESPERAR", style="dim")
     elif rsi_4h < 45 and rsi_1h < 45 and rsi_5m >= 65 and vol_ok:
-        t.append("SHORT", style="bold red")
+        if _market_open():
+            t.append("SHORT", style="bold red")
+        else:
+            t.append("ESPERAR", style="dim")
     elif max(rsi_4h, rsi_1h, rsi_5m) > 55 and min(rsi_4h, rsi_1h, rsi_5m) < 45:
         t.append("NEUTRAL", style="dim white")
     else:
@@ -235,7 +241,16 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
 # ═════════════════════════════════════════════════════════════════════════════
 # Schedule helpers
 # ═════════════════════════════════════════════════════════════════════════════
-def _next_friday_930() -> datetime:
+def _market_open() -> bool:
+    """True if current ET time is within regular session (Mon–Fri 09:30–16:00)."""
+    now = datetime.now(ET)
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return time(9, 30) <= t < time(16, 0)
+
+
+
     """Return the next Friday 09:30 ET as UTC-aware datetime."""
     now = datetime.now(ET)
     days_ahead = (4 - now.weekday()) % 7   # 4 = Friday
