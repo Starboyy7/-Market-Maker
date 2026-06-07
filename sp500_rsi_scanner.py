@@ -67,7 +67,7 @@ TIMEFRAMES = {
 TF_SCHEDULE = {
     "5min": {"type": "interval", "seconds": 15 * 60},           # every 15 min
     "1h":   {"type": "interval", "seconds": 5 * 60 * 60},       # every 5 hours
-    "4h":   {"type": "weekly_friday"},
+    "4h":   {"type": "interval", "seconds": 4 * 60 * 60},       # every 4 hours
 }
 
 RSI_PERIOD   = 4
@@ -615,7 +615,9 @@ def build_summary(scan_data: dict) -> Text:
         if has_extreme:
             active += 1
     t = Text()
-    t.append("Señales activas: ", style="bold")
+    t.append("Monitoreados: ", style="bold")
+    t.append(str(len(scan_data)), style="cyan")
+    t.append("  Con señal: ", style="bold")
     t.append(str(active), style="cyan")
     t.append("  BUY: ", style="bold")
     t.append(str(buy_s),  style="bold green")
@@ -846,8 +848,7 @@ def main():
             f"\n[bold cyan]Watch mode — {len(tickers)} acciones[/bold cyan]\n"
             f"  [bold]5min[/bold] → refresco cada [cyan]15 minutos[/cyan]\n"
             f"  [bold]1h[/bold]   → refresco cada [cyan]5 horas[/cyan]\n"
-            f"  [bold]4h[/bold]   → refresco cada [cyan]viernes 09:30 ET[/cyan]  "
-            f"(próximo: {_next_friday_930().strftime('%Y-%m-%d')})\n"
+            f"  [bold]4h[/bold]   → refresco cada [cyan]4 horas[/cyan]\n"
         )
         time.sleep(1.5)
         run_watch(tickers, demo)
