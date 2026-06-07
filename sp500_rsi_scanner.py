@@ -69,12 +69,14 @@ TF_SCHEDULE = {
 }
 
 RSI_PERIOD   = 4   # default (used for display label)
-OVERBOUGHT   = 80
-OVERSOLD     = 20
 DIV_LOOKBACK = 20
 
 # RSI period per timeframe — entry sensitive, context selective
 RSI_PERIODS = {"5min": 4, "1h": 7, "4h": 14}
+
+# Overbought/oversold thresholds per timeframe
+OVERBOUGHT = {"5min": 80, "1h": 70, "4h": 65}
+OVERSOLD   = {"5min": 20, "1h": 30, "4h": 35}
 
 # Relative volume thresholds — signal requires vol_ratio >= threshold
 VOL_THRESHOLDS: dict[str, float] = {
@@ -447,9 +449,11 @@ def scan_timeframe(tickers: list[str], tf_name: str,
         last       = float(rsi.iloc[-1])
         if np.isnan(last):
             continue
-        if last >= OVERBOUGHT:
+        ob = OVERBOUGHT.get(tf_name, 80)
+        os = OVERSOLD.get(tf_name, 20)
+        if last >= ob:
             cond = "overbought"
-        elif last <= OVERSOLD:
+        elif last <= os:
             cond = "oversold"
         else:
             cond = ""
@@ -583,7 +587,7 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
 def build_legend() -> Text:
     t = Text()
     t.append("Leyenda  ", style="bold")
-    t.append("🔺 Sobrecompra ≥80  🔻 Sobreventa ≤20  ")
+    t.append("🔺 Sobrecompra 5M≥80 1H≥70 4H≥65  🔻 Sobreventa 5M≤20 1H≤30 4H≤35  ")
     t.append("↑div", style="bold green")
     t.append(" div alcista  ")
     t.append("↓div", style="bold red")
@@ -762,8 +766,8 @@ def run_watch(tickers: list[str], use_demo: bool):
 def run_once(tickers: list[str], use_demo: bool):
     console.print(
         f"\n[bold cyan]Escaneando {len(tickers)} acciones del S&P 500…[/bold cyan]\n"
-        f"RSI({RSI_PERIOD})  Sobrecompra≥[bold red]{OVERBOUGHT}[/bold red]  "
-        f"Sobreventa≤[bold green]{OVERSOLD}[/bold green]  "
+        f"RSI(4/7/14)  Sobrecompra [bold red]80/70/65[/bold red]  "
+        f"Sobreventa [bold green]20/30/35[/bold green]  "
         f"Timeframes: [italic]{', '.join(TIMEFRAMES)}[/italic]\n"
     )
 
