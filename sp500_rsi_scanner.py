@@ -175,10 +175,13 @@ def calc_slope(close: pd.Series, lookback: int = 5) -> str:
     """
     Net % change over last `lookback` candles.
     Lookback is TF-adaptive: 5 (5min) / 8 (1h) / 10 (4h).
+    Returns '--' when market is closed — after-hours data is not meaningful.
     ↑↑ = net positive  (> +0.3%)
     ↓↓ = net negative  (< -0.3%)
     →  = lateral       (within ±0.3%)
     """
+    if not _market_open():
+        return "--"
     if len(close) < lookback + 1:
         return ""
     c_now  = float(close.iloc[-1])
