@@ -14,12 +14,14 @@ Watch mode refresh schedule (--watch):
 """
 
 import os
+import csv
 import argparse
 import random
 import threading
 import time
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -87,6 +89,15 @@ VOL_THRESHOLD_DEFAULT = 1.5
 
 # Slope lookback per timeframe (candles)
 SLOPE_LOOKBACK = {"5min": 5, "1h": 8, "4h": 10}
+
+LOG_FILE = Path("signal_log.csv")
+LOG_FIELDS = [
+    "timestamp", "ticker", "señal", "market_open",
+    "rsi_5m", "slope_5m", "vol_5m",
+    "rsi_1h", "slope_1h", "vol_1h",
+    "rsi_4h", "slope_4h", "vol_4h",
+    "precio",
+]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -466,6 +477,7 @@ def scan_timeframe(tickers: list[str], tf_name: str,
             "divergence": detect_divergence(close, rsi) if cond else "",
             "slope":     calc_slope(close, SLOPE_LOOKBACK.get(tf_name, 5)),
             "vol_ratio": vol_ratio,
+            "price":     round(float(close.iloc[-1]), 4),
         }
     return results
 
@@ -529,6 +541,32 @@ def _cell(info: dict) -> Text:
     return cell
 
 
+def log_signal(ticker: str, signal: str, tf_data: dict):
+    """Append one row per ticker per render cycle to signal_log.csv."""
+    write_header = not LOG_FILE.exists()
+    d5 = tf_data.get("5min", {})
+    d1 = tf_data.get("1h",   {})
+    d4 = tf_data.get("4h",   {})
+    row = {
+        "timestamp":   datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
+        "ticker":      ticker,
+        "señal":       signal,
+        "market_open": _market_open(),
+        "rsi_5m":      d5.get("rsi", ""),  "slope_5m": d5.get("slope", ""),
+        "vol_5m":      d5.get("vol_ratio", ""),
+        "rsi_1h":      d1.get("rsi", ""),  "slope_1h": d1.get("slope", ""),
+        "vol_1h":      d1.get("vol_ratio", ""),
+        "rsi_4h":      d4.get("rsi", ""),  "slope_4h": d4.get("slope", ""),
+        "vol_4h":      d4.get("vol_ratio", ""),
+        "precio":      d5.get("price", ""),
+    }
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+
 def build_table(scan_data: dict, last_refresh: dict[str, datetime],
                 next_refresh: dict[str, datetime],
                 status: str = "", demo: bool = False) -> Table:
@@ -576,7 +614,9 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
         )
     else:
         for ticker, tf_data in sorted(scan_data.items()):
-            row: list = [ticker, calc_alignment(ticker, tf_data)]
+            alignment = calc_alignment(ticker, tf_data)
+            log_signal(ticker, alignment.plain, tf_data)
+            row: list = [ticker, alignment]
             for tf in tf_cols:
                 if tf not in tf_data:
                     row.append(Text("·", style="dim"))
