@@ -136,6 +136,52 @@ def resolve_signal(condition: str, divergence: str) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Multi-TF alignment signal
+# ═════════════════════════════════════════════════════════════════════════════
+def calc_alignment(tf_data: dict) -> Text:
+    """
+    Priority order:
+      1. BLOQ  — divergence active in any TF (noise filter)
+      2. LONG  — 4H > 55  AND 1H > 55  AND 5M ≤ 35  (entry from oversold)
+      3. SHORT — 4H < 45  AND 1H < 45  AND 5M ≥ 65  (entry from overbought)
+      4. NEUTRAL — contradicting TFs
+      5. ESPERAR — no clear setup yet
+    """
+    # BLOQ: any active divergence blocks the trade
+    for info in tf_data.values():
+        div  = info.get("divergence", "")
+        cond = info.get("condition", "")
+        if div:
+            sig = resolve_signal(cond, div)
+            t = Text()
+            if "CONT" in sig:
+                t.append("BLOQ CONT", style="bold yellow")
+            elif div == "bearish":
+                t.append("BLOQ ↓div", style="bold red")
+            else:
+                t.append("BLOQ ↑div", style="bold green")
+            return t
+
+    rsi_5m = tf_data.get("5min", {}).get("rsi")
+    rsi_1h = tf_data.get("1h",   {}).get("rsi")
+    rsi_4h = tf_data.get("4h",   {}).get("rsi")
+
+    if None in (rsi_5m, rsi_1h, rsi_4h):
+        return Text("—", style="dim")
+
+    t = Text()
+    if rsi_4h > 55 and rsi_1h > 55 and rsi_5m <= 35:
+        t.append("LONG", style="bold green")
+    elif rsi_4h < 45 and rsi_1h < 45 and rsi_5m >= 65:
+        t.append("SHORT", style="bold red")
+    elif max(rsi_4h, rsi_1h, rsi_5m) > 55 and min(rsi_4h, rsi_1h, rsi_5m) < 45:
+        t.append("NEUTRAL", style="dim white")
+    else:
+        t.append("ESPERAR", style="dim")
+    return t
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Schedule helpers
 # ═════════════════════════════════════════════════════════════════════════════
 def _next_friday_930() -> datetime:
@@ -418,6 +464,7 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
     )
 
     table.add_column("Ticker", style="bold white", width=8)
+    table.add_column("SEÑAL", justify="center", width=12)
     for tf in tf_cols:
         last  = last_refresh.get(tf)
         nxt   = next_refresh.get(tf)
@@ -441,12 +488,12 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
 
     if not scan_data:
         table.add_row(
-            "[dim]—[/dim]",
+            "[dim]—[/dim]", "[dim]—[/dim]",
             *["[dim]sin datos[/dim]"] * len(tf_cols)
         )
     else:
         for ticker, tf_data in sorted(scan_data.items()):
-            row: list = [ticker]
+            row: list = [ticker, calc_alignment(tf_data)]
             for tf in tf_cols:
                 if tf not in tf_data:
                     row.append(Text("·", style="dim"))
