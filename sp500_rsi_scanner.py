@@ -162,25 +162,24 @@ def calc_rel_volume(df: pd.DataFrame) -> float:
 # ═════════════════════════════════════════════════════════════════════════════
 # Price slope
 # ═════════════════════════════════════════════════════════════════════════════
-def calc_slope(close: pd.Series) -> str:
+def calc_slope(close: pd.Series, lookback: int = 5) -> str:
     """
-    Compare last 3 closes.
-    ↑↑ = two consecutive ascending closes
-    ↓↓ = two consecutive descending closes
-    →  = lateral (last move < 0.3%)
+    Net % change over last `lookback` candles.
+    ↑↑ = net positive  (> +0.3%)
+    ↓↓ = net negative  (< -0.3%)
+    →  = lateral       (within ±0.3%)
+    Using net change avoids single-candle pauses masking a sustained trend.
     """
-    if len(close) < 3:
+    if len(close) < lookback + 1:
         return ""
-    c1 = float(close.iloc[-3])
-    c2 = float(close.iloc[-2])
-    c3 = float(close.iloc[-1])
-    if c2 != 0 and abs(c3 - c2) / c2 < 0.003:
+    c_now  = float(close.iloc[-1])
+    c_prev = float(close.iloc[-1 - lookback])
+    if c_prev == 0:
+        return ""
+    chg = (c_now - c_prev) / c_prev
+    if abs(chg) < 0.003:
         return "→"
-    if c3 > c2 > c1:
-        return "↑↑"
-    if c3 < c2 < c1:
-        return "↓↓"
-    return "→"
+    return "↑↑" if chg > 0 else "↓↓"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
