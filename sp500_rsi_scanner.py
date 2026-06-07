@@ -39,10 +39,7 @@ console = Console()
 ET = ZoneInfo("America/New_York")
 
 # Default tickers for quick scans (used when no --tickers / --top given)
-DEFAULT_TICKERS = [
-    "AAPL","MSFT","NVDA","TSLA","AMZN",
-    "GOOGL","META","JPM","NFLX","AMD",
-]
+DEFAULT_TICKERS = ["NVDA", "AAPL", "TSLA", "AMD", "AMZN"]
 
 # ─── S&P 500 tickers (top 100 by market cap) ─────────────────────────────────
 SP500_TICKERS = [
