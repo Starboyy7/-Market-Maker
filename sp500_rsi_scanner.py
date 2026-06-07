@@ -136,6 +136,30 @@ def resolve_signal(condition: str, divergence: str) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Price slope
+# ═════════════════════════════════════════════════════════════════════════════
+def calc_slope(close: pd.Series) -> str:
+    """
+    Compare last 3 closes.
+    ↑↑ = two consecutive ascending closes
+    ↓↓ = two consecutive descending closes
+    →  = lateral (last move < 0.3%)
+    """
+    if len(close) < 3:
+        return ""
+    c1 = float(close.iloc[-3])
+    c2 = float(close.iloc[-2])
+    c3 = float(close.iloc[-1])
+    if c2 != 0 and abs(c3 - c2) / c2 < 0.003:
+        return "→"
+    if c3 > c2 > c1:
+        return "↑↑"
+    if c3 < c2 < c1:
+        return "↓↓"
+    return "→"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Multi-TF alignment signal
 # ═════════════════════════════════════════════════════════════════════════════
 def calc_alignment(tf_data: dict) -> Text:
@@ -398,6 +422,7 @@ def scan_timeframe(tickers: list[str], tf_name: str,
             "rsi":       round(last, 1),
             "condition": cond,
             "divergence": detect_divergence(close, rsi) if cond else "",
+            "slope":     calc_slope(close),
         }
     return results
 
@@ -428,19 +453,20 @@ def _cell(info: dict) -> Text:
     rsi_val = info["rsi"]
     cond    = info["condition"]
     div     = info["divergence"]
+    slope   = info.get("slope", "")
     cell    = Text()
     if cond:
         signal = resolve_signal(cond, div)
         color  = "red" if cond == "overbought" else "green"
         icon   = "🔺" if cond == "overbought" else "🔻"
-        cell.append(f"RSI {rsi_val} {icon}", style=f"bold {color}")
+        cell.append(f"RSI {rsi_val} {slope} {icon}", style=f"bold {color}")
         if div == "bullish":
             cell.append("  ↑div", style="bold green")
         elif div == "bearish":
             cell.append("  ↓div", style="bold red")
         cell.append(f"\n{signal}")
     else:
-        cell.append(f"RSI {rsi_val}", style="dim")
+        cell.append(f"RSI {rsi_val} {slope}", style="dim")
     return cell
 
 
