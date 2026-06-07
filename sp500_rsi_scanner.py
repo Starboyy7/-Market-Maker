@@ -20,7 +20,7 @@ import random
 import threading
 import time
 import warnings
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -246,8 +246,8 @@ def _market_open() -> bool:
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return False
-    t = now.time()
-    return time(9, 30) <= t < time(16, 0)
+    hm = (now.hour, now.minute)
+    return (9, 30) <= hm < (16, 0)
 
 
 
