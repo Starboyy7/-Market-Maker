@@ -222,7 +222,7 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
     if None in (rsi_5m, rsi_1h, rsi_4h):
         return Text("—", style="dim")
 
-    vol_ok = vol_5m >= threshold
+    vol_ok = vol_5m is not None and vol_5m >= threshold
     t = Text()
     if rsi_4h > 55 and rsi_1h > 55 and rsi_5m <= 35 and vol_ok:
         if _market_open():
