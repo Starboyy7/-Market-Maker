@@ -10,8 +10,7 @@ Data sources (priority order):
 Watch mode refresh schedule (--watch):
   5min  → every 15 minutes
   1h    → every 5 hours
-  4h    → every Friday at market open (09:30 ET)
-  1D    → every Friday at market open (09:30 ET)
+  4h    → every 4 hours
 """
 
 import os
@@ -63,7 +62,6 @@ TIMEFRAMES = {
 }
 
 # Refresh schedule per timeframe
-# "weekly_friday" means: once per week, on Friday
 TF_SCHEDULE = {
     "5min": {"type": "interval", "seconds": 15 * 60},           # every 15 min
     "1h":   {"type": "interval", "seconds": 5 * 60 * 60},       # every 5 hours
@@ -247,21 +245,6 @@ def _market_open() -> bool:
         return False
     hm = (now.hour, now.minute)
     return (9, 30) <= hm < (16, 0)
-
-
-
-    """Return the next Friday 09:30 ET as UTC-aware datetime."""
-    now = datetime.now(ET)
-    days_ahead = (4 - now.weekday()) % 7   # 4 = Friday
-    if days_ahead == 0:
-        # today is Friday — if before 09:30 stay today, else next week
-        target = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        if now >= target:
-            days_ahead = 7
-    else:
-        pass
-    next_fri = now + timedelta(days=days_ahead if days_ahead else 7)
-    return next_fri.replace(hour=9, minute=30, second=0, microsecond=0)
 
 
 def _seconds_until(dt: datetime) -> float:
@@ -552,11 +535,8 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
         nxt   = next_refresh.get(tf)
         sched = TF_SCHEDULE[tf]
 
-        if sched["type"] == "weekly_friday":
-            cadence = "viernes"
-        else:
-            mins = sched["seconds"] // 60
-            cadence = f"/{mins}min" if mins < 60 else f"/{mins//60}h"
+        mins    = sched["seconds"] // 60
+        cadence = f"/{mins}min" if mins < 60 else f"/{mins//60}h"
 
         refresh_info = ""
         if last:
@@ -649,10 +629,7 @@ class WatchState:
         # Compute initial "next refresh" for each timeframe
         now = datetime.now(ET)
         for tf_name, sched in TF_SCHEDULE.items():
-            if sched["type"] == "interval":
-                self.next_refresh[tf_name] = now + timedelta(seconds=sched["seconds"])
-            else:
-                self.next_refresh[tf_name] = _next_friday_930()
+            self.next_refresh[tf_name] = now + timedelta(seconds=sched["seconds"])
 
     def refresh_tf(self, tf_name: str):
         with self.lock:
@@ -677,10 +654,7 @@ class WatchState:
                 self.scan_data.setdefault(ticker, {})[tf_name] = info
 
             self.last_refresh[tf_name] = now
-            if sched["type"] == "interval":
-                self.next_refresh[tf_name] = now + timedelta(seconds=sched["seconds"])
-            else:
-                self.next_refresh[tf_name] = _next_friday_930()
+            self.next_refresh[tf_name] = now + timedelta(seconds=sched["seconds"])
 
             self.seed_offset += 1
             self.status = ""
