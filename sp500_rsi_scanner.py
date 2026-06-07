@@ -60,7 +60,6 @@ TIMEFRAMES = {
     "5min": {"interval": "5m",  "period": "5d"},
     "1h":   {"interval": "1h",  "period": "30d"},
     "4h":   {"interval": "1h",  "period": "60d"},   # resampled to 4h
-    "1D":   {"interval": "1d",  "period": "180d"},
 }
 
 # Refresh schedule per timeframe
@@ -69,7 +68,6 @@ TF_SCHEDULE = {
     "5min": {"type": "interval", "seconds": 15 * 60},           # every 15 min
     "1h":   {"type": "interval", "seconds": 5 * 60 * 60},       # every 5 hours
     "4h":   {"type": "weekly_friday"},
-    "1D":   {"type": "weekly_friday"},
 }
 
 RSI_PERIOD   = 4
@@ -719,8 +717,6 @@ def main():
             f"  [bold]5min[/bold] → refresco cada [cyan]15 minutos[/cyan]\n"
             f"  [bold]1h[/bold]   → refresco cada [cyan]5 horas[/cyan]\n"
             f"  [bold]4h[/bold]   → refresco cada [cyan]viernes 09:30 ET[/cyan]  "
-            f"(próximo: {_next_friday_930().strftime('%Y-%m-%d')})\n"
-            f"  [bold]1D[/bold]   → refresco cada [cyan]viernes 09:30 ET[/cyan]  "
             f"(próximo: {_next_friday_930().strftime('%Y-%m-%d')})\n"
         )
         time.sleep(1.5)
