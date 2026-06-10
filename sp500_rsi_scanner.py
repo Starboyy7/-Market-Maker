@@ -566,7 +566,8 @@ def _cell(info: dict) -> Text:
         elif div == "bearish":
             cell.append("  ↓div", style="bold red")
         cell.append_text(_vol_text(vol_ratio))
-        cell.append(f"\n{signal}")
+        if signal != "—":
+            cell.append(f" {signal}")
     else:
         cell.append(f"RSI {rsi_val} {slope}", style="dim")
         cell.append_text(_vol_text(vol_ratio))
@@ -631,7 +632,8 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
             + (f"  [dim]{status}[/dim]" if status else "")
         ),
         box=box.SIMPLE_HEAD,
-        show_lines=True,
+        show_lines=False,
+        pad_edge=False,
         expand=True,
     )
 
