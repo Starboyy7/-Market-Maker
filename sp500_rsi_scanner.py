@@ -442,14 +442,46 @@ def fetch_ohlcv(ticker: str, interval: str, period: str,
 # ═════════════════════════════════════════════════════════════════════════════
 # Per-timeframe scanner
 # ═════════════════════════════════════════════════════════════════════════════
+def fetch_yfinance_batch(tickers: list[str], interval: str,
+                         period: str) -> dict[str, pd.DataFrame]:
+    """Download all tickers in one yfinance call — much faster than one-by-one."""
+    try:
+        import yfinance as yf
+        df = yf.download(tickers, interval=interval, period=period,
+                         auto_adjust=True, progress=False,
+                         group_by="ticker", threads=True)
+        if df is None or df.empty:
+            return {}
+        out: dict[str, pd.DataFrame] = {}
+        if isinstance(df.columns, pd.MultiIndex):
+            for t in tickers:
+                if t in df.columns.get_level_values(0):
+                    sub = df[t].dropna(how="all")
+                    if not sub.empty:
+                        out[t] = sub
+        elif len(tickers) == 1:
+            out[tickers[0]] = df
+        return out
+    except Exception:
+        return {}
+
+
 def scan_timeframe(tickers: list[str], tf_name: str,
                    use_demo: bool = False, seed_offset: int = 0) -> dict:
     """Returns {ticker: {rsi, condition, divergence}} for one timeframe."""
     cfg     = TIMEFRAMES[tf_name]
     results = {}
+
+    # Batch download (real data only) — single API call for all tickers
+    batch: dict[str, pd.DataFrame] = {}
+    if not use_demo:
+        batch = fetch_yfinance_batch(tickers, cfg["interval"], cfg["period"])
+
     for ticker in tickers:
-        df = fetch_ohlcv(ticker, cfg["interval"], cfg["period"],
-                         use_demo, seed_offset)
+        df = batch.get(ticker)
+        if df is None:
+            df = fetch_ohlcv(ticker, cfg["interval"], cfg["period"],
+                             use_demo, seed_offset)
         if df is None:
             continue
         if tf_name == "4h":
