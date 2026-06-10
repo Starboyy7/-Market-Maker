@@ -39,8 +39,8 @@ warnings.filterwarnings("ignore")
 console = Console()
 ET = ZoneInfo("America/New_York")
 
-# Default tickers for quick scans (used when no --tickers / --top given)
-DEFAULT_TICKERS = ["NVDA", "AAPL", "TSLA", "AMD", "AMZN"]
+# Default: scan top 50 S&P 500 tickers (used when no --tickers / --top given)
+DEFAULT_TOP = 50
 
 # ─── S&P 500 tickers (top 100 by market cap) ─────────────────────────────────
 SP500_TICKERS = [
@@ -891,9 +891,7 @@ def parse_args():
 
 def main():
     args    = parse_args()
-    tickers = args.tickers or (
-        SP500_TICKERS[:args.top] if args.top else DEFAULT_TICKERS
-    )
+    tickers = args.tickers or SP500_TICKERS[:(args.top or DEFAULT_TOP)]
     demo = args.demo or not _yfinance_available()
 
     if demo and not args.demo:
