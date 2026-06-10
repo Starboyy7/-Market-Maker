@@ -541,6 +541,23 @@ def _cell(info: dict) -> Text:
     return cell
 
 
+_SIGNAL_CLEAN = {
+    "LONG":       "LONG",
+    "SHORT":      "SHORT",
+    "NEUTRAL":    "NEUTRAL",
+    "ESPERAR":    "ESPERAR",
+    "BLOQ CONT":  "BLOQ_CONT",
+    "BLOQ ↓div":  "BLOQ_DIV_BAJISTA",
+    "BLOQ ↑div":  "BLOQ_DIV_ALCISTA",
+}
+
+def _clean_signal(signal: str) -> str:
+    for key, val in _SIGNAL_CLEAN.items():
+        if key in signal:
+            return val
+    return signal.strip() or "—"
+
+
 def log_signal(ticker: str, signal: str, tf_data: dict):
     """Append one row per ticker per render cycle to signal_log.csv."""
     write_header = not LOG_FILE.exists()
@@ -550,7 +567,7 @@ def log_signal(ticker: str, signal: str, tf_data: dict):
     row = {
         "timestamp":   datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
         "ticker":      ticker,
-        "señal":       signal,
+        "señal":       _clean_signal(signal),
         "market_open": _market_open(),
         "rsi_5m":      d5.get("rsi", ""),  "slope_5m": d5.get("slope", ""),
         "vol_5m":      d5.get("vol_ratio", ""),
@@ -560,7 +577,7 @@ def log_signal(ticker: str, signal: str, tf_data: dict):
         "vol_4h":      d4.get("vol_ratio", ""),
         "precio":      d5.get("price", ""),
     }
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+    with open(LOG_FILE, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
         if write_header:
             w.writeheader()
