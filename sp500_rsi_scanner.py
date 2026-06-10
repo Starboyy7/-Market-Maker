@@ -721,6 +721,13 @@ class WatchState:
 
             self.seed_offset += 1
             self.status = ""
+            # Snapshot for logging (outside lock below)
+            snapshot = {t: dict(d) for t, d in self.scan_data.items()}
+
+        # Write CSV immediately after scan — don't wait for render
+        for ticker, tf_data in snapshot.items():
+            alignment = calc_alignment(ticker, tf_data)
+            log_signal(ticker, alignment.plain, tf_data)
 
 
 def _tf_worker(tf_name: str, state: WatchState, stop_event: threading.Event):
