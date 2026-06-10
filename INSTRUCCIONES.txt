@@ -1,0 +1,79 @@
+═══════════════════════════════════════════════════════════════════
+  S&P 500 RSI SCANNER — INSTRUCCIONES DE USO
+═══════════════════════════════════════════════════════════════════
+
+PASO 1 — Instalar Git (solo la primera vez)
+-------------------------------------------
+Descarga e instala desde: https://git-scm.com/download/win
+
+
+PASO 2 — Instalar Python (solo la primera vez)
+----------------------------------------------
+Descarga e instala desde: https://python.org/downloads
+⚠ IMPORTANTE: marca la casilla "Add Python to PATH" durante la instalación.
+
+
+PASO 3 — Clonar el repositorio (solo la primera vez)
+----------------------------------------------------
+    cd C:\Users\gatos
+    git clone https://github.com/starboyy7/-market-maker.git
+    cd -market-maker
+    git checkout claude/zealous-pascal-Ysg2j
+
+
+PASO 4 — Instalar dependencias (solo la primera vez)
+----------------------------------------------------
+    pip install -r requirements.txt
+
+
+PASO 5 — Actualizar el código (cada vez antes de correr)
+--------------------------------------------------------
+    cd C:\Users\gatos\-market-maker
+    git pull origin claude/zealous-pascal-Ysg2j
+
+
+PASO 6 — Correr el scanner
+--------------------------
+    python sp500_rsi_scanner.py --top 50 --watch
+
+Otras variantes:
+    python sp500_rsi_scanner.py --watch                          (5 tickers por defecto)
+    python sp500_rsi_scanner.py --demo --watch                   (datos sintéticos, sin internet)
+    python sp500_rsi_scanner.py --tickers AAPL NVDA TSLA --watch (tickers específicos)
+
+Horario recomendado: lunes a viernes 8:30 AM – 3:00 PM hora México
+(mercado de NY abierto: 9:30 – 16:00 ET)
+
+Ctrl+C para detener el scanner.
+
+
+PASO 7 — Ver señales generadas
+------------------------------
+Ver todo el historial:
+    type signal_log.csv
+
+Ver solo señales LONG y SHORT:
+    powershell "Import-Csv signal_log.csv | Where-Object { $_.señal -match 'LONG|SHORT' } | Format-Table"
+
+Ver una acción específica (ej. NVDA):
+    powershell "Import-Csv signal_log.csv | Where-Object { $_.ticker -eq 'NVDA' } | Format-Table"
+
+Ver en tiempo real mientras corre el scanner:
+    powershell "Get-Content signal_log.csv -Wait -Tail 10"
+
+
+═══════════════════════════════════════════════════════════════════
+  LÓGICA DEL SCANNER (referencia rápida)
+═══════════════════════════════════════════════════════════════════
+
+Timeframes y periodos RSI:
+    5min → RSI(4)    |  sobrecompra ≥ 80, sobreventa ≤ 20
+    1h   → RSI(7)    |  sobrecompra ≥ 70, sobreventa ≤ 30
+    4h   → RSI(14)   |  sobrecompra ≥ 65, sobreventa ≤ 35
+
+Señal de alineación multi-timeframe (columna SEÑAL):
+    LONG    → 4H>55 Y 1H>55 Y 5M≤35 Y volumen ≥ umbral
+    SHORT   → 4H<45 Y 1H<45 Y 5M≥65 Y volumen ≥ umbral
+    BLOQ    → divergencia activa en algún TF (bloquea la entrada)
+    NEUTRAL → timeframes contradictorios
+    ESPERAR → sin setup claro todavía
