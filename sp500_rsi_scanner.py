@@ -662,9 +662,21 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
             *["[dim]sin datos[/dim]"] * len(tf_cols)
         )
     else:
+        hidden = 0
         for ticker, tf_data in sorted(scan_data.items()):
             alignment = calc_alignment(ticker, tf_data)
             log_signal(ticker, alignment.plain, tf_data)
+
+            # Show only tickers with something relevant: active alignment
+            # signal, extreme RSI condition, or divergence in any TF.
+            interesting = alignment.plain not in ("ESPERAR", "NEUTRAL", "—") or any(
+                info.get("condition") or info.get("divergence")
+                for info in tf_data.values()
+            )
+            if not interesting:
+                hidden += 1
+                continue
+
             row: list = [ticker, alignment]
             for tf in tf_cols:
                 if tf not in tf_data:
@@ -672,6 +684,13 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
                 else:
                     row.append(_cell(tf_data[tf]))
             table.add_row(*row)
+
+        if hidden:
+            table.add_row(
+                Text(f"+{hidden}", style="dim"),
+                Text("sin setup", style="dim"),
+                *[Text("·", style="dim")] * len(tf_cols),
+            )
 
     return table
 
