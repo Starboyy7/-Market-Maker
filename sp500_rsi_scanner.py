@@ -325,8 +325,13 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
 # ═════════════════════════════════════════════════════════════════════════════
 # Schedule helpers
 # ═════════════════════════════════════════════════════════════════════════════
+_FORCE_OPEN = False  # backtest replays session bars as if the market were open
+
+
 def _market_open() -> bool:
     """True if current ET time is within regular session (Mon–Fri 09:30–16:00)."""
+    if _FORCE_OPEN:
+        return True
     now = datetime.now(ET)
     if now.weekday() >= 5:
         return False
@@ -537,39 +542,46 @@ def scan_timeframe(tickers: list[str], tf_name: str,
                              use_demo, seed_offset)
         if df is None:
             continue
-        if len(df) < RSI_PERIOD + 10:
-            continue
-        vol_ratio  = calc_rel_volume(df)
-        close      = df["Close"].squeeze()
-        rsi_period = RSI_PERIODS.get(tf_name, RSI_PERIOD)
-        rsi        = calc_rsi(close, rsi_period)
-        last       = float(rsi.iloc[-1])
-        if np.isnan(last):
-            continue
-        ob = OVERBOUGHT.get(tf_name, 80)
-        os = OVERSOLD.get(tf_name, 20)
-        if last >= ob:
-            cond = "overbought"
-        elif last <= os:
-            cond = "oversold"
-        else:
-            cond = ""
-        info = {
-            "rsi":       round(last, 1),
-            "condition": cond,
-            "divergence": detect_divergence(close, rsi) if cond else "",
-            "slope":     calc_slope(close, SLOPE_LOOKBACK.get(tf_name, 5)),
-            "vol_ratio": vol_ratio,
-            "price":     round(float(close.iloc[-1]), 4),
-        }
-        # Direction filters
-        if tf_name == "1h":
-            info["above_ema"] = calc_above_ema(close)
-        elif tf_name == "5min":
-            info["above_vwap"] = calc_above_vwap(df)
-            info["vwma_up"]    = calc_vwma_vs_sma(df)
-        results[ticker] = info
+        info = _analyze_df(df, tf_name)
+        if info is not None:
+            results[ticker] = info
     return results
+
+
+def _analyze_df(df: pd.DataFrame, tf_name: str) -> dict | None:
+    """Compute RSI, condition, divergence and direction filters for one df."""
+    if df is None or len(df) < RSI_PERIOD + 10:
+        return None
+    vol_ratio  = calc_rel_volume(df)
+    close      = df["Close"].squeeze()
+    rsi_period = RSI_PERIODS.get(tf_name, RSI_PERIOD)
+    rsi        = calc_rsi(close, rsi_period)
+    last       = float(rsi.iloc[-1])
+    if np.isnan(last):
+        return None
+    ob = OVERBOUGHT.get(tf_name, 80)
+    os = OVERSOLD.get(tf_name, 20)
+    if last >= ob:
+        cond = "overbought"
+    elif last <= os:
+        cond = "oversold"
+    else:
+        cond = ""
+    info = {
+        "rsi":       round(last, 1),
+        "condition": cond,
+        "divergence": detect_divergence(close, rsi) if cond else "",
+        "slope":     calc_slope(close, SLOPE_LOOKBACK.get(tf_name, 5)),
+        "vol_ratio": vol_ratio,
+        "price":     round(float(close.iloc[-1]), 4),
+    }
+    # Direction filters
+    if tf_name == "1h":
+        info["above_ema"] = calc_above_ema(close)
+    elif tf_name == "5min":
+        info["above_vwap"] = calc_above_vwap(df)
+        info["vwma_up"]    = calc_vwma_vs_sma(df)
+    return info
 
 
 def full_scan(tickers: list[str], use_demo: bool = False,
@@ -947,6 +959,100 @@ def run_watch(tickers: list[str], use_demo: bool):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Backtest — replay today's session bar by bar
+# ═════════════════════════════════════════════════════════════════════════════
+def run_backtest(tickers: list[str], use_demo: bool):
+    global _FORCE_OPEN
+
+    console.print(
+        f"\n[bold cyan]Backtest intradía — {len(tickers)} acciones[/bold cyan]\n"
+        f"[dim]Reproduce la última sesión vela a vela (5min) con la lógica "
+        f"actual de señales.[/dim]\n"
+    )
+
+    # Download full data once per timeframe
+    data: dict[str, dict[str, pd.DataFrame]] = {}
+    for tf_name, cfg in TIMEFRAMES.items():
+        console.print(f"[dim]Descargando {tf_name}…[/dim]")
+        batch: dict[str, pd.DataFrame] = {}
+        if not use_demo:
+            batch = fetch_yfinance_batch(tickers, cfg["interval"], cfg["period"])
+        for t in tickers:
+            df = batch.get(t)
+            if df is None:
+                df = fetch_ohlcv(t, cfg["interval"], cfg["period"], use_demo)
+            if df is not None and not df.empty:
+                data.setdefault(t, {})[tf_name] = df
+
+    events: list[tuple] = []
+    _FORCE_OPEN = True
+    try:
+        for ticker, tfs in sorted(data.items()):
+            df5 = tfs.get("5min")
+            if df5 is None or "5min" not in tfs or len(tfs) < 3:
+                continue
+            idx      = pd.to_datetime(df5.index)
+            last_day = idx[-1].date()
+            session  = df5.index[idx.date == last_day]
+
+            prev_sig = ""
+            for ts in session:
+                tf_data: dict = {}
+                for tf_name, df in tfs.items():
+                    sliced = df[df.index <= ts]
+                    info   = _analyze_df(sliced, tf_name)
+                    if info is not None:
+                        tf_data[tf_name] = info
+                if len(tf_data) < 3:
+                    continue
+                sig = calc_alignment(ticker, tf_data).plain
+                if sig != prev_sig and sig in ("LONG", "SHORT") or \
+                   (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ")):
+                    events.append((
+                        pd.to_datetime(ts).strftime("%H:%M"),
+                        ticker, sig,
+                        tf_data["5min"]["price"],
+                        tf_data["5min"]["rsi"],
+                        tf_data.get("15min", {}).get("rsi", ""),
+                        tf_data.get("1h", {}).get("rsi", ""),
+                    ))
+                prev_sig = sig
+    finally:
+        _FORCE_OPEN = False
+
+    if not events:
+        console.print(
+            f"\n[yellow]Sin señales LONG/SHORT en la sesión del "
+            f"{last_day if data else '—'}.[/yellow]\n"
+            f"[dim]La alineación completa (RSI + EMA50 + VWAP + VWMA + "
+            f"volumen) no se dio en ningún momento.[/dim]\n"
+        )
+        return
+
+    table = Table(
+        title=f"[bold cyan]Señales del backtest — sesión {last_day}[/bold cyan]",
+        box=box.SIMPLE_HEAD,
+    )
+    for col in ("Hora ET", "Ticker", "Señal", "Precio",
+                "RSI 5m", "RSI 15m", "RSI 1h"):
+        table.add_column(col, justify="center")
+    for ev in sorted(events):
+        hora, tic, sig, px, r5, r15, r1h = ev
+        style = ("bold green" if sig == "LONG"
+                 else "bold red" if sig == "SHORT" else "yellow")
+        table.add_row(hora, tic, Text(sig, style=style),
+                      str(px), str(r5), str(r15), str(r1h))
+    console.print(table)
+    longs  = sum(1 for e in events if e[2] == "LONG")
+    shorts = sum(1 for e in events if e[2] == "SHORT")
+    bloqs  = len(events) - longs - shorts
+    console.print(
+        f"\n[bold]Total:[/bold] [green]{longs} LONG[/green]  "
+        f"[red]{shorts} SHORT[/red]  [yellow]{bloqs} BLOQ[/yellow]\n"
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # One-shot scan (no watch)
 # ═════════════════════════════════════════════════════════════════════════════
 def run_once(tickers: list[str], use_demo: bool):
@@ -1008,6 +1114,9 @@ def parse_args():
                    help="Specific tickers, e.g. --tickers AAPL MSFT NVDA TSLA AMZN")
     p.add_argument("--top",     type=int, default=None,
                    help="Scan first N tickers from the built-in list.")
+    p.add_argument("--backtest", action="store_true",
+                   help="Replay today's session bar by bar and list the "
+                        "LONG/SHORT signals it would have generated.")
     return p.parse_args()
 
 
@@ -1022,7 +1131,9 @@ def main():
             "usando datos sintéticos (--demo).[/yellow]\n"
         )
 
-    if args.watch:
+    if args.backtest:
+        run_backtest(tickers, demo)
+    elif args.watch:
         # Print schedule info before entering live screen
         console.print(
             f"\n[bold cyan]Watch mode — {len(tickers)} acciones[/bold cyan]\n"
