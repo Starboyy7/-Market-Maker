@@ -924,139 +924,224 @@ def run_watch(tickers: list[str], use_demo: bool):
 # ═════════════════════════════════════════════════════════════════════════════
 # Backtest — replay today's session bar by bar
 # ═════════════════════════════════════════════════════════════════════════════
-def run_backtest(tickers: list[str], use_demo: bool, all_hours: bool = False):
+def run_backtest(tickers: list[str], use_demo: bool,
+                 all_hours: bool = False, days: int = 1):
     global _FORCE_OPEN
 
+    # For multi-day we need more history — use max allowed by yfinance for 5min (60d)
+    bt_periods = {
+        "5min":  "60d" if days > 5 else "5d",
+        "15min": "60d" if days > 5 else "5d",
+        "1h":    "60d",
+    }
+    bt_intervals = {"5min": "5m", "15min": "15m", "1h": "1h"}
+
     console.print(
-        f"\n[bold cyan]Backtest intradía — {len(tickers)} acciones[/bold cyan]\n"
-        f"[dim]Reproduce la última sesión vela a vela (5min) con la lógica "
-        f"actual de señales.[/dim]\n"
+        f"\n[bold cyan]Backtest intradía — {len(tickers)} acciones  "
+        f"{'último mes' if days >= 20 else f'últimos {days} día(s)'}[/bold cyan]\n"
+        f"[dim]Reproduce cada sesión vela a vela (5min).[/dim]\n"
     )
 
     # Download full data once per timeframe
     data: dict[str, dict[str, pd.DataFrame]] = {}
-    for tf_name, cfg in TIMEFRAMES.items():
+    for tf_name in TIMEFRAMES:
         console.print(f"[dim]Descargando {tf_name}…[/dim]")
+        interval = bt_intervals[tf_name]
+        period   = bt_periods[tf_name]
         batch: dict[str, pd.DataFrame] = {}
         if not use_demo:
-            batch = fetch_yfinance_batch(tickers, cfg["interval"], cfg["period"])
+            batch = fetch_yfinance_batch(tickers, interval, period)
         for t in tickers:
             df = batch.get(t)
             if df is None:
-                df = fetch_ohlcv(t, cfg["interval"], cfg["period"], use_demo)
+                df = fetch_ohlcv(t, interval, period, use_demo)
             if df is not None and not df.empty:
                 data.setdefault(t, {})[tf_name] = df
 
-    events: list[tuple] = []
+    # Collect all trading days available in the 5min data
+    all_days: list = []
+    for tfs in data.values():
+        df5 = tfs.get("5min")
+        if df5 is not None:
+            idx = pd.to_datetime(df5.index)
+            all_days = sorted(set(idx.date))
+            break
+    session_days = all_days[-days:] if days < len(all_days) else all_days
+
+    # Per-day results
+    day_summary: list[tuple] = []   # (date, wins, losses, bloqs, roi)
+
     _FORCE_OPEN = True
     try:
-        for ticker, tfs in sorted(data.items()):
-            df5 = tfs.get("5min")
-            if df5 is None or "5min" not in tfs or len(tfs) < 3:
-                continue
-            idx      = pd.to_datetime(df5.index)
-            last_day = idx[-1].date()
-            session  = df5.index[idx.date == last_day]
+        for session_date in session_days:
+            events: list[tuple] = []
 
-            prev_sig = ""
-            for ts in session:
-                tf_data: dict = {}
-                for tf_name, df in tfs.items():
-                    sliced = df[df.index <= ts]
-                    info   = _analyze_df(sliced, tf_name)
-                    if info is not None:
-                        tf_data[tf_name] = info
-                if len(tf_data) < 3:
+            for ticker, tfs in sorted(data.items()):
+                df5 = tfs.get("5min")
+                if df5 is None or len(tfs) < 3:
                     continue
-                sig = calc_alignment(ticker, tf_data).plain
-                ts_dt = pd.to_datetime(ts)
-                hm_ts = (ts_dt.hour, ts_dt.minute)
-                in_window = all_hours or (TRADE_START <= hm_ts < TRADE_END)
-                if in_window and (
-                    (sig != prev_sig and sig in ("LONG", "SHORT")) or
-                    (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
-                ):
-                    events.append((
-                        ts_dt.strftime("%H:%M"),
-                        ticker, sig,
-                        tf_data["5min"]["price"],
-                        tf_data["5min"]["rsi"],
-                        tf_data.get("15min", {}).get("rsi", ""),
-                        tf_data.get("1h", {}).get("rsi", ""),
-                    ))
-                prev_sig = sig
+                idx     = pd.to_datetime(df5.index)
+                session = df5.index[idx.date == session_date]
+                if len(session) < 10:
+                    continue
+
+                prev_sig = ""
+                for ts in session:
+                    tf_data: dict = {}
+                    for tf_name, df in tfs.items():
+                        sliced = df[df.index <= ts]
+                        info   = _analyze_df(sliced, tf_name)
+                        if info is not None:
+                            tf_data[tf_name] = info
+                    if len(tf_data) < 3:
+                        continue
+                    sig   = calc_alignment(ticker, tf_data).plain
+                    ts_dt = pd.to_datetime(ts)
+                    hm_ts = (ts_dt.hour, ts_dt.minute)
+                    in_window = all_hours or (TRADE_START <= hm_ts < TRADE_END)
+                    if in_window and (
+                        (sig != prev_sig and sig in ("LONG", "SHORT")) or
+                        (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
+                    ):
+                        events.append((
+                            ts_dt.strftime("%H:%M"), ticker, sig,
+                            tf_data["5min"]["price"],
+                            tf_data["5min"]["rsi"],
+                            tf_data.get("15min", {}).get("rsi", ""),
+                            tf_data.get("1h", {}).get("rsi", ""),
+                        ))
+                    prev_sig = sig
+
+            # Session close prices for this day
+            session_close: dict[str, float] = {}
+            for ticker, tfs in data.items():
+                df5 = tfs.get("5min")
+                if df5 is None:
+                    continue
+                day_bars = df5.index[pd.to_datetime(df5.index).date == session_date]
+                if len(day_bars):
+                    session_close[ticker] = round(
+                        float(df5.loc[day_bars[-1], "Close"]), 4)
+
+            # Calculate ROI per event
+            wins = losses = bloqs = 0
+            day_roi = 0.0
+            ev_rows: list[tuple] = []
+            for ev in sorted(events):
+                hora, tic, sig, px, r5, r15, r1h = ev
+                if sig in ("LONG", "SHORT") and px:
+                    close_px = session_close.get(tic)
+                    if close_px:
+                        roi = ((close_px - px) / px * 100) if sig == "LONG" \
+                              else ((px - close_px) / px * 100)
+                        roi = round(roi, 2)
+                        day_roi += roi
+                        if roi >= 0:
+                            wins += 1
+                        else:
+                            losses += 1
+                        ev_rows.append((hora, tic, sig, px,
+                                        close_px, roi, r5, r15, r1h))
+                    else:
+                        ev_rows.append((hora, tic, sig, px,
+                                        None, None, r5, r15, r1h))
+                else:
+                    bloqs += 1
+                    ev_rows.append((hora, tic, sig, px,
+                                    None, None, r5, r15, r1h))
+
+            # Print per-day table only if single day; otherwise just summary
+            if days == 1:
+                _print_day_table(session_date, ev_rows, wins, losses,
+                                 bloqs, day_roi)
+            else:
+                traded = wins + losses
+                wr = f"{wins/traded*100:.0f}%" if traded else "—"
+                day_summary.append((session_date, wins, losses, bloqs,
+                                    round(day_roi, 2), wr))
     finally:
         _FORCE_OPEN = False
 
-    if not events:
-        console.print(
-            f"\n[yellow]Sin señales LONG/SHORT en la sesión del "
-            f"{last_day if data else '—'}.[/yellow]\n"
-            f"[dim]La alineación completa (RSI + EMA50 + VWAP + "
-            f"volumen) no se dio en ningún momento.[/dim]\n"
-        )
-        return
+    if days > 1:
+        _print_month_summary(day_summary)
 
-    # Build close-of-session price map {ticker: last_close}
-    session_close: dict[str, float] = {}
-    for ticker, tfs in data.items():
-        df5 = tfs.get("5min")
-        if df5 is None:
-            continue
-        idx      = pd.to_datetime(df5.index)
-        last_day_data = df5.index[idx.date == last_day]
-        if len(last_day_data):
-            session_close[ticker] = round(float(df5.loc[last_day_data[-1], "Close"]), 4)
+
+def _print_day_table(session_date, ev_rows, wins, losses, bloqs, day_roi):
+    traded = wins + losses
+    wr  = f"{wins/traded*100:.0f}%" if traded else "—"
+    avg = f"{day_roi/traded:+.2f}%" if traded else "—"
 
     table = Table(
-        title=f"[bold cyan]Señales del backtest — sesión {last_day}[/bold cyan]",
+        title=f"[bold cyan]Backtest — sesión {session_date}[/bold cyan]",
         box=box.SIMPLE_HEAD,
     )
     for col in ("Hora ET", "Ticker", "Señal", "Entrada",
                 "Cierre", "ROI%", "RSI 5m", "RSI 15m", "RSI 1h"):
         table.add_column(col, justify="center")
 
-    wins = losses = 0
-    total_roi = 0.0
-    for ev in sorted(events):
-        hora, tic, sig, px, r5, r15, r1h = ev
+    for hora, tic, sig, px, close_px, roi, r5, r15, r1h in ev_rows:
         sig_style = ("bold green" if sig == "LONG"
                      else "bold red" if sig == "SHORT" else "yellow")
-        close_px = session_close.get(tic)
-        if close_px and sig in ("LONG", "SHORT") and px:
-            roi = ((close_px - px) / px * 100) if sig == "LONG" \
-                  else ((px - close_px) / px * 100)
-            roi = round(roi, 2)
-            total_roi += roi
-            if roi >= 0:
-                wins += 1
-                roi_text = Text(f"+{roi:.2f}%", style="bold green")
-            else:
-                losses += 1
-                roi_text = Text(f"{roi:.2f}%", style="bold red")
+        if roi is not None and sig in ("LONG", "SHORT"):
+            roi_text = Text(f"+{roi:.2f}%" if roi >= 0 else f"{roi:.2f}%",
+                            style="bold green" if roi >= 0 else "bold red")
+            cp_str = str(close_px)
         else:
             roi_text = Text("—", style="dim")
-            close_px = close_px or "—"
-
-        table.add_row(
-            hora, tic,
-            Text(sig, style=sig_style),
-            str(px), str(close_px), roi_text,
-            str(r5), str(r15), str(r1h),
-        )
+            cp_str   = str(close_px) if close_px else "—"
+        table.add_row(hora, tic, Text(sig, style=sig_style),
+                      str(px), cp_str, roi_text,
+                      str(r5), str(r15), str(r1h))
     console.print(table)
-
-    longs  = sum(1 for e in events if e[2] == "LONG")
-    shorts = sum(1 for e in events if e[2] == "SHORT")
-    bloqs  = len(events) - longs - shorts
-    traded = wins + losses
-    wr     = f"{wins/traded*100:.0f}%" if traded else "—"
-    avg    = f"{total_roi/traded:+.2f}%" if traded else "—"
     console.print(
-        f"\n[bold]Total:[/bold] [green]{longs} LONG[/green]  "
-        f"[red]{shorts} SHORT[/red]  [yellow]{bloqs} BLOQ[/yellow]  "
+        f"\n[bold]Total:[/bold] [green]{wins+losses-losses+losses} trades[/green]  "
+        f"[green]{wins}W[/green] [red]{losses}L[/red]  "
+        f"[yellow]{bloqs} BLOQ[/yellow]  "
         f"│  Win rate: [cyan]{wr}[/cyan]  "
+        f"ROI acum: [cyan]{day_roi:+.2f}%[/cyan]  "
         f"ROI promedio: [cyan]{avg}[/cyan]\n"
+    )
+
+
+def _print_month_summary(day_summary: list[tuple]):
+    table = Table(
+        title="[bold cyan]Backtest — resumen mensual[/bold cyan]",
+        box=box.SIMPLE_HEAD,
+    )
+    for col in ("Fecha", "Trades", "W", "L", "BLOQ",
+                "Win rate", "ROI día", "ROI acum"):
+        table.add_column(col, justify="center")
+
+    cum_roi = 0.0
+    total_w = total_l = total_b = 0
+    for date, wins, losses, bloqs, day_roi, wr in day_summary:
+        cum_roi += day_roi
+        total_w += wins
+        total_l += losses
+        total_b += bloqs
+        traded   = wins + losses
+        roi_style = "bold green" if day_roi >= 0 else "bold red"
+        cum_style = "bold green" if cum_roi >= 0 else "bold red"
+        table.add_row(
+            str(date),
+            str(traded),
+            str(wins), str(losses), str(bloqs),
+            wr,
+            Text(f"{day_roi:+.2f}%", style=roi_style),
+            Text(f"{cum_roi:+.2f}%", style=cum_style),
+        )
+
+    console.print(table)
+    total_traded = total_w + total_l
+    global_wr    = f"{total_w/total_traded*100:.0f}%" if total_traded else "—"
+    avg_day      = f"{cum_roi/len(day_summary):+.2f}%" if day_summary else "—"
+    console.print(
+        f"\n[bold]TOTAL:[/bold]  {total_traded} trades  "
+        f"[green]{total_w}W[/green] [red]{total_l}L[/red]  "
+        f"[yellow]{total_b} BLOQ[/yellow]  "
+        f"│  Win rate global: [cyan]{global_wr}[/cyan]  "
+        f"ROI acumulado: [cyan]{cum_roi:+.2f}%[/cyan]  "
+        f"Promedio/día: [cyan]{avg_day}[/cyan]\n"
     )
 
 
@@ -1127,6 +1212,9 @@ def parse_args():
                         "LONG/SHORT signals it would have generated.")
     p.add_argument("--all-hours", action="store_true",
                    help="With --backtest: include signals outside 09:50–15:30 window.")
+    p.add_argument("--days", type=int, default=1,
+                   help="With --backtest: number of sessions to replay (max ~42). "
+                        "Use --days 22 for ~1 month.")
     return p.parse_args()
 
 
@@ -1142,7 +1230,7 @@ def main():
         )
 
     if args.backtest:
-        run_backtest(tickers, demo, all_hours=args.all_hours)
+        run_backtest(tickers, demo, all_hours=args.all_hours, days=args.days)
     elif args.watch:
         # Print schedule info before entering live screen
         console.print(
