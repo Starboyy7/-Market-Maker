@@ -8,9 +8,9 @@ Data sources (priority order):
   3. --demo          — synthetic data, no internet required
 
 Watch mode refresh schedule (--watch):
-  5min  → every 15 minutes
-  1h    → every 5 hours
-  4h    → every 4 hours
+  5min  → every 5 minutes
+  15min → every 15 minutes
+  1h    → every 1 hour
 """
 
 import os
@@ -57,28 +57,33 @@ SP500_TICKERS = [
 ]
 
 # ─── Timeframe config ─────────────────────────────────────────────────────────
+# Intraday system: 1h = direction, 15min = confirmation, 5min = entry
 TIMEFRAMES = {
-    "5min": {"interval": "5m",  "period": "5d"},
-    "1h":   {"interval": "1h",  "period": "30d"},
-    "4h":   {"interval": "1h",  "period": "60d"},   # resampled to 4h
+    "5min":  {"interval": "5m",  "period": "5d"},
+    "15min": {"interval": "15m", "period": "5d"},
+    "1h":    {"interval": "1h",  "period": "30d"},
 }
 
 # Refresh schedule per timeframe
 TF_SCHEDULE = {
-    "5min": {"type": "interval", "seconds": 15 * 60},           # every 15 min
-    "1h":   {"type": "interval", "seconds": 5 * 60 * 60},       # every 5 hours
-    "4h":   {"type": "interval", "seconds": 4 * 60 * 60},       # every 4 hours
+    "5min":  {"type": "interval", "seconds": 5 * 60},        # every 5 min
+    "15min": {"type": "interval", "seconds": 15 * 60},       # every 15 min
+    "1h":    {"type": "interval", "seconds": 60 * 60},       # every 1 hour
 }
 
 RSI_PERIOD   = 4   # default (used for display label)
 DIV_LOOKBACK = 20
 
-# RSI period per timeframe — entry sensitive, context selective
-RSI_PERIODS = {"5min": 4, "1h": 7, "4h": 14}
+# RSI period per timeframe — entry sensitive, direction stable
+RSI_PERIODS = {"5min": 4, "15min": 7, "1h": 14}
 
 # Overbought/oversold thresholds per timeframe
-OVERBOUGHT = {"5min": 80, "1h": 70, "4h": 65}
-OVERSOLD   = {"5min": 20, "1h": 30, "4h": 35}
+OVERBOUGHT = {"5min": 80, "15min": 75, "1h": 70}
+OVERSOLD   = {"5min": 20, "15min": 25, "1h": 30}
+
+# Direction filters
+EMA_PERIOD  = 50   # EMA on 1h closes — macro trend filter
+VWMA_PERIOD = 20   # VWMA vs SMA on 5min — volume-backed move check
 
 # Relative volume thresholds — signal requires vol_ratio >= threshold
 VOL_THRESHOLDS: dict[str, float] = {
@@ -88,14 +93,15 @@ VOL_THRESHOLDS: dict[str, float] = {
 VOL_THRESHOLD_DEFAULT = 1.5
 
 # Slope lookback per timeframe (candles)
-SLOPE_LOOKBACK = {"5min": 5, "1h": 8, "4h": 10}
+SLOPE_LOOKBACK = {"5min": 5, "15min": 6, "1h": 8}
 
 LOG_FILE = Path("signal_log.csv")
 LOG_FIELDS = [
     "timestamp", "ticker", "señal", "market_open",
     "rsi_5m", "slope_5m", "vol_5m",
+    "rsi_15m", "slope_15m", "vol_15m",
     "rsi_1h", "slope_1h", "vol_1h",
-    "rsi_4h", "slope_4h", "vol_4h",
+    "tendencia_ema", "vwap", "vwma_ok",
     "precio",
 ]
 
@@ -180,6 +186,46 @@ def calc_rel_volume(df: pd.DataFrame) -> float | None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Direction filters: EMA, VWAP, VWMA
+# ═════════════════════════════════════════════════════════════════════════════
+def calc_above_ema(close: pd.Series, period: int = EMA_PERIOD) -> bool | None:
+    """True if last close is above EMA(period). None if not enough data."""
+    if len(close) < period:
+        return None
+    ema = close.ewm(span=period, adjust=False).mean()
+    return bool(close.iloc[-1] > ema.iloc[-1])
+
+
+def calc_above_vwap(df: pd.DataFrame) -> bool | None:
+    """True if last close is above today's session VWAP (intraday bars)."""
+    if df is None or "Volume" not in df.columns or len(df) < 2:
+        return None
+    idx = pd.to_datetime(df.index)
+    last_day = idx[-1].date()
+    day = df[idx.date == last_day]
+    vol = day["Volume"].astype(float)
+    if len(day) < 2 or vol.sum() == 0:
+        return None
+    typical = (day["High"] + day["Low"] + day["Close"]) / 3
+    vwap = (typical * vol).cumsum() / vol.cumsum()
+    return bool(day["Close"].iloc[-1] > vwap.iloc[-1])
+
+
+def calc_vwma_vs_sma(df: pd.DataFrame, period: int = VWMA_PERIOD) -> bool | None:
+    """True if VWMA(period) > SMA(period) — move is backed by volume.
+    False if below, None if not enough data."""
+    if df is None or "Volume" not in df.columns or len(df) < period:
+        return None
+    close = df["Close"].astype(float)
+    vol   = df["Volume"].astype(float)
+    if vol.iloc[-period:].sum() == 0:
+        return None
+    vwma = (close * vol).rolling(period).sum() / vol.rolling(period).sum()
+    sma  = close.rolling(period).mean()
+    return bool(vwma.iloc[-1] > sma.iloc[-1])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Price slope
 # ═════════════════════════════════════════════════════════════════════════════
 def calc_slope(close: pd.Series, lookback: int = 5) -> str:
@@ -210,10 +256,13 @@ def calc_slope(close: pd.Series, lookback: int = 5) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 def calc_alignment(ticker: str, tf_data: dict) -> Text:
     """
+    Intraday system — 1h direction, 15min confirmation, 5min entry.
+
     Priority order:
       1. BLOQ    — divergence active in any TF (noise filter)
-      2. LONG    — 4H>55 AND 1H>55 AND 5M≤35 AND vol≥threshold
-      3. SHORT   — 4H<45 AND 1H<45 AND 5M≥65 AND vol≥threshold
+      2. LONG    — 1H RSI>55 + precio>EMA50(1H) + precio>VWAP
+                   + 15M RSI>50 + 5M RSI≤25 + vol≥threshold + VWMA>SMA
+      3. SHORT   — all inverted (5M RSI≥75)
       4. NEUTRAL — contradicting TFs
       5. ESPERAR — no clear setup yet
     """
@@ -232,28 +281,41 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
                 t.append("BLOQ ↑div", style="bold green")
             return t
 
-    rsi_5m    = tf_data.get("5min", {}).get("rsi")
-    rsi_1h    = tf_data.get("1h",   {}).get("rsi")
-    rsi_4h    = tf_data.get("4h",   {}).get("rsi")
-    vol_5m    = tf_data.get("5min", {}).get("vol_ratio", 0.0)
+    d5  = tf_data.get("5min",  {})
+    d15 = tf_data.get("15min", {})
+    d1h = tf_data.get("1h",    {})
+
+    rsi_5m  = d5.get("rsi")
+    rsi_15m = d15.get("rsi")
+    rsi_1h  = d1h.get("rsi")
+    vol_5m  = d5.get("vol_ratio", 0.0)
     threshold = VOL_THRESHOLDS.get(ticker, VOL_THRESHOLD_DEFAULT)
 
-    if None in (rsi_5m, rsi_1h, rsi_4h):
+    if None in (rsi_5m, rsi_15m, rsi_1h):
         return Text("—", style="dim")
 
-    vol_ok = vol_5m is not None and vol_5m >= threshold
+    vol_ok     = vol_5m is not None and vol_5m >= threshold
+    above_ema  = d1h.get("above_ema")    # price vs EMA50 on 1h
+    above_vwap = d5.get("above_vwap")    # price vs session VWAP
+    vwma_up    = d5.get("vwma_up")       # VWMA>SMA on 5min
+
+    long_dir  = above_ema is True  and above_vwap is True
+    short_dir = above_ema is False and above_vwap is False
+
     t = Text()
-    if rsi_4h > 55 and rsi_1h > 55 and rsi_5m <= 35 and vol_ok:
+    if (rsi_1h > 55 and long_dir and rsi_15m > 50
+            and rsi_5m <= 25 and vol_ok and vwma_up is True):
         if _market_open():
             t.append("LONG", style="bold green")
         else:
             t.append("ESPERAR", style="dim")
-    elif rsi_4h < 45 and rsi_1h < 45 and rsi_5m >= 65 and vol_ok:
+    elif (rsi_1h < 45 and short_dir and rsi_15m < 50
+            and rsi_5m >= 75 and vol_ok and vwma_up is False):
         if _market_open():
             t.append("SHORT", style="bold red")
         else:
             t.append("ESPERAR", style="dim")
-    elif max(rsi_4h, rsi_1h, rsi_5m) > 55 and min(rsi_4h, rsi_1h, rsi_5m) < 45:
+    elif max(rsi_1h, rsi_15m, rsi_5m) > 55 and min(rsi_1h, rsi_15m, rsi_5m) < 45:
         t.append("NEUTRAL", style="dim white")
     else:
         t.append("ESPERAR", style="dim")
@@ -295,15 +357,6 @@ def _fmt_countdown(seconds: float) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 # Data providers
 # ═════════════════════════════════════════════════════════════════════════════
-def _resample_4h(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
-    return df.resample("4h").agg(
-        {"Open": "first", "High": "max", "Low": "min",
-         "Close": "last", "Volume": "sum"}
-    ).dropna()
-
-
 def fetch_yfinance(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
     try:
         import yfinance as yf
@@ -395,7 +448,7 @@ def fetch_demo(ticker: str, interval: str, period: str,
     Synthetic OHLCV.  seed_offset lets watch mode produce different data
     on each refresh cycle (simulates market movement).
     """
-    n_bars  = {"5m": 390, "1h": 200, "1d": 130}.get(interval, 150)
+    n_bars  = {"5m": 390, "15m": 260, "1h": 200, "1d": 130}.get(interval, 150)
     rng     = random.Random(hash(ticker + interval) + seed_offset)
     start_p = rng.uniform(20, 800)
     close   = _synthetic_price(n_bars, start_p)
@@ -420,7 +473,7 @@ def fetch_demo(ticker: str, interval: str, period: str,
         np.random.default_rng(42).normal(1_000_000, 300_000, n_bars)
     ).astype(int)
 
-    freq = {"5m": "5min", "1h": "h", "1d": "D"}.get(interval, "h")
+    freq = {"5m": "5min", "15m": "15min", "1h": "h", "1d": "D"}.get(interval, "h")
     idx  = pd.date_range(end=datetime.now(), periods=n_bars, freq=freq)
 
     return pd.DataFrame({
@@ -484,8 +537,6 @@ def scan_timeframe(tickers: list[str], tf_name: str,
                              use_demo, seed_offset)
         if df is None:
             continue
-        if tf_name == "4h":
-            df = _resample_4h(df)
         if len(df) < RSI_PERIOD + 10:
             continue
         vol_ratio  = calc_rel_volume(df)
@@ -503,7 +554,7 @@ def scan_timeframe(tickers: list[str], tf_name: str,
             cond = "oversold"
         else:
             cond = ""
-        results[ticker] = {
+        info = {
             "rsi":       round(last, 1),
             "condition": cond,
             "divergence": detect_divergence(close, rsi) if cond else "",
@@ -511,6 +562,13 @@ def scan_timeframe(tickers: list[str], tf_name: str,
             "vol_ratio": vol_ratio,
             "price":     round(float(close.iloc[-1]), 4),
         }
+        # Direction filters
+        if tf_name == "1h":
+            info["above_ema"] = calc_above_ema(close)
+        elif tf_name == "5min":
+            info["above_vwap"] = calc_above_vwap(df)
+            info["vwma_up"]    = calc_vwma_vs_sma(df)
+        results[ticker] = info
     return results
 
 
@@ -594,20 +652,29 @@ def _clean_signal(signal: str) -> str:
 def log_signal(ticker: str, signal: str, tf_data: dict):
     """Append one row per ticker per render cycle to signal_log.csv."""
     write_header = not LOG_FILE.exists()
-    d5 = tf_data.get("5min", {})
-    d1 = tf_data.get("1h",   {})
-    d4 = tf_data.get("4h",   {})
+    d5  = tf_data.get("5min",  {})
+    d15 = tf_data.get("15min", {})
+    d1  = tf_data.get("1h",    {})
+
+    def _dir(val, up: str, down: str) -> str:
+        if val is True:  return up
+        if val is False: return down
+        return ""
+
     row = {
         "timestamp":   datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
         "ticker":      ticker,
         "señal":       _clean_signal(signal),
         "market_open": _market_open(),
-        "rsi_5m":      d5.get("rsi", ""),  "slope_5m": d5.get("slope", ""),
+        "rsi_5m":      d5.get("rsi", ""),   "slope_5m":  d5.get("slope", ""),
         "vol_5m":      d5.get("vol_ratio", ""),
-        "rsi_1h":      d1.get("rsi", ""),  "slope_1h": d1.get("slope", ""),
+        "rsi_15m":     d15.get("rsi", ""),  "slope_15m": d15.get("slope", ""),
+        "vol_15m":     d15.get("vol_ratio", ""),
+        "rsi_1h":      d1.get("rsi", ""),   "slope_1h":  d1.get("slope", ""),
         "vol_1h":      d1.get("vol_ratio", ""),
-        "rsi_4h":      d4.get("rsi", ""),  "slope_4h": d4.get("slope", ""),
-        "vol_4h":      d4.get("vol_ratio", ""),
+        "tendencia_ema": _dir(d1.get("above_ema"),  "ALCISTA", "BAJISTA"),
+        "vwap":          _dir(d5.get("above_vwap"), "ARRIBA",  "ABAJO"),
+        "vwma_ok":       _dir(d5.get("vwma_up"),    "SI",      "NO"),
         "precio":      d5.get("price", ""),
     }
     with open(LOG_FILE, "a", newline="", encoding="utf-8-sig") as f:
@@ -699,7 +766,7 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
 def build_legend() -> Text:
     t = Text()
     t.append("Leyenda  ", style="bold")
-    t.append("🔺 Sobrecompra 5M≥80 1H≥70 4H≥65  🔻 Sobreventa 5M≤20 1H≤30 4H≤35  ")
+    t.append("🔺 Sobrecompra 5M≥80 15M≥75 1H≥70  🔻 Sobreventa 5M≤20 15M≤25 1H≤30  ")
     t.append("↑div", style="bold green")
     t.append(" div alcista  ")
     t.append("↓div", style="bold red")
@@ -885,8 +952,8 @@ def run_watch(tickers: list[str], use_demo: bool):
 def run_once(tickers: list[str], use_demo: bool):
     console.print(
         f"\n[bold cyan]Escaneando {len(tickers)} acciones del S&P 500…[/bold cyan]\n"
-        f"RSI(4/7/14)  Sobrecompra [bold red]80/70/65[/bold red]  "
-        f"Sobreventa [bold green]20/30/35[/bold green]  "
+        f"RSI(4/7/14)  Sobrecompra [bold red]80/75/70[/bold red]  "
+        f"Sobreventa [bold green]20/25/30[/bold green]  "
         f"Timeframes: [italic]{', '.join(TIMEFRAMES)}[/italic]\n"
     )
 
@@ -959,9 +1026,9 @@ def main():
         # Print schedule info before entering live screen
         console.print(
             f"\n[bold cyan]Watch mode — {len(tickers)} acciones[/bold cyan]\n"
-            f"  [bold]5min[/bold] → refresco cada [cyan]15 minutos[/cyan]\n"
-            f"  [bold]1h[/bold]   → refresco cada [cyan]5 horas[/cyan]\n"
-            f"  [bold]4h[/bold]   → refresco cada [cyan]4 horas[/cyan]\n"
+            f"  [bold]5min[/bold]  → refresco cada [cyan]5 minutos[/cyan]\n"
+            f"  [bold]15min[/bold] → refresco cada [cyan]15 minutos[/cyan]\n"
+            f"  [bold]1h[/bold]    → refresco cada [cyan]1 hora[/cyan]\n"
         )
         time.sleep(1.5)
         run_watch(tickers, demo)
