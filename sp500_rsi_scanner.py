@@ -712,7 +712,7 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
 
             # Show only tickers with something relevant: active alignment
             # signal, extreme RSI condition, or divergence in any TF.
-            interesting = alignment.plain not in ("ESPERAR", "NEUTRAL", "—") or any(
+            interesting = alignment.plain not in ("ESPERAR", "—") or any(
                 info.get("condition") or info.get("divergence")
                 for info in tf_data.values()
             )
@@ -969,10 +969,16 @@ def run_backtest(tickers: list[str], use_demo: bool):
                 if len(tf_data) < 3:
                     continue
                 sig = calc_alignment(ticker, tf_data).plain
-                if sig != prev_sig and sig in ("LONG", "SHORT") or \
-                   (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ")):
+                # Apply trading-hours filter: only include events 09:50–15:30 ET
+                ts_dt = pd.to_datetime(ts)
+                hm_ts = (ts_dt.hour, ts_dt.minute)
+                in_window = TRADE_START <= hm_ts < TRADE_END
+                if in_window and (
+                    (sig != prev_sig and sig in ("LONG", "SHORT")) or
+                    (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
+                ):
                     events.append((
-                        pd.to_datetime(ts).strftime("%H:%M"),
+                        ts_dt.strftime("%H:%M"),
                         ticker, sig,
                         tf_data["5min"]["price"],
                         tf_data["5min"]["rsi"],
@@ -987,7 +993,7 @@ def run_backtest(tickers: list[str], use_demo: bool):
         console.print(
             f"\n[yellow]Sin señales LONG/SHORT en la sesión del "
             f"{last_day if data else '—'}.[/yellow]\n"
-            f"[dim]La alineación completa (RSI + EMA50 + VWAP + VWMA + "
+            f"[dim]La alineación completa (RSI + EMA50 + VWAP + "
             f"volumen) no se dio en ningún momento.[/dim]\n"
         )
         return
@@ -1090,7 +1096,7 @@ def main():
 
     if demo and not args.demo:
         console.print(
-            "[yellow]⚠  yfinance / Alpha Vantage no disponible — "
+            "[yellow]⚠  yfinance no disponible — "
             "usando datos sintéticos (--demo).[/yellow]\n"
         )
 
