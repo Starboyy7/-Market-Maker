@@ -4,8 +4,7 @@ Detects overbought/oversold conditions and bullish/bearish divergences.
 
 Data sources (priority order):
   1. yfinance        — Yahoo Finance, no API key needed
-  2. Alpha Vantage   — set env ALPHAVANTAGE_API_KEY
-  3. --demo          — synthetic data, no internet required
+  2. --demo          — synthetic data, no internet required
 
 Watch mode refresh schedule (--watch):
   5min  → every 5 minutes
@@ -13,7 +12,6 @@ Watch mode refresh schedule (--watch):
   1h    → every 1 hour
 """
 
-import os
 import csv
 import argparse
 import random
@@ -88,7 +86,6 @@ OVERSOLD   = {"5min": 20, "15min": 25, "1h": 30}
 
 # Direction filters
 EMA_PERIOD  = 50   # EMA on 1h closes — macro trend filter
-VWMA_PERIOD = 20   # VWMA vs SMA on 5min — volume-backed move check
 
 # Relative volume thresholds — signal requires vol_ratio >= threshold
 VOL_THRESHOLDS: dict[str, float] = {
@@ -97,16 +94,17 @@ VOL_THRESHOLDS: dict[str, float] = {
 }
 VOL_THRESHOLD_DEFAULT = 1.5
 
-# Slope lookback per timeframe (candles)
-SLOPE_LOOKBACK = {"5min": 5, "15min": 6, "1h": 8}
+# Trading hours filter (ET) — no signals outside this window
+TRADE_START = (9, 50)   # ignore first 20 min of session (noise)
+TRADE_END   = (15, 30)  # no new entries in last 30 min
 
 LOG_FILE = Path("signal_log.csv")
 LOG_FIELDS = [
     "timestamp", "ticker", "señal", "market_open",
-    "rsi_5m", "slope_5m", "vol_5m",
-    "rsi_15m", "slope_15m", "vol_15m",
-    "rsi_1h", "slope_1h", "vol_1h",
-    "tendencia_ema", "vwap", "vwma_ok",
+    "rsi_5m", "vol_5m",
+    "rsi_15m", "vol_15m",
+    "rsi_1h", "vol_1h",
+    "tendencia_ema", "vwap",
     "precio",
 ]
 
@@ -237,46 +235,6 @@ def calc_above_vwap(df: pd.DataFrame) -> bool | None:
     return bool(day["Close"].iloc[-1] > vwap.iloc[-1])
 
 
-def calc_vwma_vs_sma(df: pd.DataFrame, period: int = VWMA_PERIOD) -> bool | None:
-    """True if VWMA(period) > SMA(period) — move is backed by volume.
-    False if below, None if not enough data."""
-    if df is None or "Volume" not in df.columns or len(df) < period:
-        return None
-    close = df["Close"].astype(float)
-    vol   = df["Volume"].astype(float)
-    if vol.iloc[-period:].sum() == 0:
-        return None
-    vwma = (close * vol).rolling(period).sum() / vol.rolling(period).sum()
-    sma  = close.rolling(period).mean()
-    return bool(vwma.iloc[-1] > sma.iloc[-1])
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Price slope
-# ═════════════════════════════════════════════════════════════════════════════
-def calc_slope(close: pd.Series, lookback: int = 5) -> str:
-    """
-    Net % change over last `lookback` candles.
-    Lookback is TF-adaptive: 5 (5min) / 8 (1h) / 10 (4h).
-    Returns '--' when market is closed — after-hours data is not meaningful.
-    ↑↑ = net positive  (> +0.3%)
-    ↓↓ = net negative  (< -0.3%)
-    →  = lateral       (within ±0.3%)
-    """
-    if not _market_open():
-        return "--"
-    if len(close) < lookback + 1:
-        return ""
-    c_now  = float(close.iloc[-1])
-    c_prev = float(close.iloc[-1 - lookback])
-    if c_prev == 0:
-        return ""
-    chg = (c_now - c_prev) / c_prev
-    if abs(chg) < 0.003:
-        return "→"
-    return "↑↑" if chg > 0 else "↓↓"
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Multi-TF alignment signal
 # ═════════════════════════════════════════════════════════════════════════════
@@ -285,21 +243,34 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
     Intraday system — 1h direction, 15min confirmation, 5min entry.
 
     Priority order:
-      1. BLOQ    — divergence active in any TF (noise filter)
+      1. BLOQ    — divergence contrary to trade direction blocks the trade
       2. LONG    — 1H RSI>55 + precio>EMA50(1H) + precio>VWAP
-                   + 15M RSI>50 + 5M RSI≤25 + vol≥threshold + VWMA>SMA
-      3. SHORT   — all inverted (5M RSI≥75)
-      4. NEUTRAL — contradicting TFs
-      5. ESPERAR — no clear setup yet
+                   + 15M RSI>50 + 5M RSI 20-35 (reversal) + vol≥threshold
+      3. SHORT   — all inverted (5M RSI 65-80)
+      4. ESPERAR — no clear setup yet
     """
-    # BLOQ: any active divergence blocks the trade
+    # Evaluate preliminary direction from 1H RSI before checking divergences
+    d5_pre  = tf_data.get("5min",  {})
+    d15_pre = tf_data.get("15min", {})
+    d1h_pre = tf_data.get("1h",    {})
+    rsi_1h_pre  = d1h_pre.get("rsi", 50)
+    rsi_15m_pre = d15_pre.get("rsi", 50)
+    rsi_5m_pre  = d5_pre.get("rsi", 50)
+    # Tentative direction: LONG bias if 1H bullish, SHORT bias if bearish
+    bias = "long" if rsi_1h_pre > 55 else "short" if rsi_1h_pre < 45 else ""
+
+    # BLOQ: only block when divergence is CONTRARY to the trade direction
     for info in tf_data.values():
         div  = info.get("divergence", "")
         cond = info.get("condition", "")
-        if div:
-            sig = resolve_signal(cond, div)
+        if not div:
+            continue
+        # bearish divergence blocks a LONG; bullish divergence blocks a SHORT
+        contrary = (div == "bearish" and bias == "long") or \
+                   (div == "bullish" and bias == "short")
+        if contrary:
             t = Text()
-            if "CONT" in sig:
+            if "CONT" in resolve_signal(cond, div):
                 t.append("BLOQ CONT", style="bold yellow")
             elif div == "bearish":
                 t.append("BLOQ ↓div", style="bold red")
@@ -320,29 +291,30 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
     if None in (rsi_5m, rsi_15m, rsi_1h):
         return Text("—", style="dim")
 
-    vol_ok     = vol_5m is not None and vol_5m >= threshold
-    above_ema  = d1h.get("above_ema")    # price vs EMA50 on 1h
-    above_vwap = d5.get("above_vwap")    # price vs session VWAP
-    vwma_up    = d5.get("vwma_up")       # VWMA>SMA on 5min
+    vol_ok    = vol_5m is not None and vol_5m >= threshold
+    above_ema  = d1h.get("above_ema")
+    above_vwap = d5.get("above_vwap")
 
     long_dir  = above_ema is True  and above_vwap is True
     short_dir = above_ema is False and above_vwap is False
 
+    # Volume check on the reversal candle (RSI bouncing from extreme, not at extreme)
+    in_long_reversal  = 20 <= rsi_5m <= 35
+    in_short_reversal = 65 <= rsi_5m <= 80
+
     t = Text()
     if (rsi_1h > 55 and long_dir and rsi_15m > 50
-            and rsi_5m <= 25 and vol_ok and vwma_up is True):
-        if _market_open():
+            and in_long_reversal and vol_ok):
+        if _market_tradeable():
             t.append("LONG", style="bold green")
         else:
             t.append("ESPERAR", style="dim")
     elif (rsi_1h < 45 and short_dir and rsi_15m < 50
-            and rsi_5m >= 75 and vol_ok and vwma_up is False):
-        if _market_open():
+            and in_short_reversal and vol_ok):
+        if _market_tradeable():
             t.append("SHORT", style="bold red")
         else:
             t.append("ESPERAR", style="dim")
-    elif max(rsi_1h, rsi_15m, rsi_5m) > 55 and min(rsi_1h, rsi_15m, rsi_5m) < 45:
-        t.append("NEUTRAL", style="dim white")
     else:
         t.append("ESPERAR", style="dim")
     return t
@@ -355,7 +327,7 @@ _FORCE_OPEN = False  # backtest replays session bars as if the market were open
 
 
 def _market_open() -> bool:
-    """True if current ET time is within regular session (Mon–Fri 09:30–16:00)."""
+    """True if within regular NYSE session (Mon–Fri 09:30–16:00 ET)."""
     if _FORCE_OPEN:
         return True
     now = datetime.now(ET)
@@ -363,6 +335,18 @@ def _market_open() -> bool:
         return False
     hm = (now.hour, now.minute)
     return (9, 30) <= hm < (16, 0)
+
+
+def _market_tradeable() -> bool:
+    """True only during the tradeable window (09:50–15:30 ET).
+    Excludes the noisy opening 20 min and the illiquid last 30 min."""
+    if _FORCE_OPEN:
+        return True
+    if not _market_open():
+        return False
+    now = datetime.now(ET)
+    hm  = (now.hour, now.minute)
+    return TRADE_START <= hm < TRADE_END
 
 
 def _seconds_until(dt: datetime) -> float:
@@ -398,45 +382,6 @@ def fetch_yfinance(ticker: str, interval: str, period: str) -> pd.DataFrame | No
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
         return df
-    except Exception:
-        return None
-
-
-def fetch_alphavantage(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
-    api_key = os.environ.get("ALPHAVANTAGE_API_KEY")
-    if not api_key:
-        return None
-    try:
-        import requests
-        av_map = {
-            "5m": ("TIME_SERIES_INTRADAY", "5min"),
-            "1h": ("TIME_SERIES_INTRADAY", "60min"),
-            "1d": ("TIME_SERIES_DAILY_ADJUSTED", None),
-        }
-        if interval not in av_map:
-            return None
-        func, av_interval = av_map[interval]
-        params: dict = {"function": func, "symbol": ticker, "apikey": api_key,
-                        "outputsize": "full", "datatype": "json"}
-        if av_interval:
-            params["interval"] = av_interval
-        r = requests.get("https://www.alphavantage.co/query", params=params, timeout=15)
-        data = r.json()
-        ts_key = next((k for k in data if "Time Series" in k), None)
-        if not ts_key:
-            return None
-        df = pd.DataFrame(data[ts_key]).T
-        df.index = pd.to_datetime(df.index)
-        df = df.sort_index()
-        df.columns = [c.split(". ")[1].capitalize() for c in df.columns]
-        df = df.rename(columns={"Adjusted close": "Close"})
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col])
-        days = {"5d": 5, "30d": 30, "60d": 60, "180d": 180}.get(period, 30)
-        cutoff = datetime.now() - timedelta(days=days)
-        df = df[df.index >= cutoff]
-        return df if not df.empty else None
     except Exception:
         return None
 
@@ -517,10 +462,7 @@ def fetch_ohlcv(ticker: str, interval: str, period: str,
                 use_demo: bool = False, seed_offset: int = 0) -> pd.DataFrame | None:
     if use_demo:
         return fetch_demo(ticker, interval, period, seed_offset)
-    df = fetch_yfinance(ticker, interval, period)
-    if df is not None:
-        return df
-    return fetch_alphavantage(ticker, interval, period)
+    return fetch_yfinance(ticker, interval, period)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -597,7 +539,6 @@ def _analyze_df(df: pd.DataFrame, tf_name: str) -> dict | None:
         "rsi":       round(last, 1),
         "condition": cond,
         "divergence": detect_divergence(close, rsi) if cond else "",
-        "slope":     calc_slope(close, SLOPE_LOOKBACK.get(tf_name, 5)),
         "vol_ratio": vol_ratio,
         "price":     round(float(close.iloc[-1]), 4),
     }
@@ -606,7 +547,6 @@ def _analyze_df(df: pd.DataFrame, tf_name: str) -> dict | None:
         info["above_ema"] = calc_above_ema(close)
     elif tf_name == "5min":
         info["above_vwap"] = calc_above_vwap(df)
-        info["vwma_up"]    = calc_vwma_vs_sma(df)
     return info
 
 
@@ -649,14 +589,13 @@ def _cell(info: dict) -> Text:
     rsi_val   = info["rsi"]
     cond      = info["condition"]
     div       = info["divergence"]
-    slope     = info.get("slope", "")
     vol_ratio = info.get("vol_ratio", 0.0)
     cell      = Text()
     if cond:
         signal = resolve_signal(cond, div)
         color  = "red" if cond == "overbought" else "green"
         icon   = "🔺" if cond == "overbought" else "🔻"
-        cell.append(f"RSI {rsi_val} {slope} {icon}", style=f"bold {color}")
+        cell.append(f"RSI {rsi_val} {icon}", style=f"bold {color}")
         if div == "bullish":
             cell.append("  ↑div", style="bold green")
         elif div == "bearish":
@@ -665,7 +604,7 @@ def _cell(info: dict) -> Text:
         if signal != "—":
             cell.append(f"\n{signal}")
     else:
-        cell.append(f"RSI {rsi_val} {slope}", style="dim")
+        cell.append(f"RSI {rsi_val}", style="dim")
         cell.append_text(_vol_text(vol_ratio))
     return cell
 
@@ -673,7 +612,6 @@ def _cell(info: dict) -> Text:
 _SIGNAL_CLEAN = {
     "LONG":       "LONG",
     "SHORT":      "SHORT",
-    "NEUTRAL":    "NEUTRAL",
     "ESPERAR":    "ESPERAR",
     "BLOQ CONT":  "BLOQ_CONT",
     "BLOQ ↓div":  "BLOQ_DIV_BAJISTA",
@@ -704,15 +642,14 @@ def log_signal(ticker: str, signal: str, tf_data: dict):
         "ticker":      ticker,
         "señal":       _clean_signal(signal),
         "market_open": _market_open(),
-        "rsi_5m":      d5.get("rsi", ""),   "slope_5m":  d5.get("slope", ""),
+        "rsi_5m":      d5.get("rsi", ""),
         "vol_5m":      d5.get("vol_ratio", ""),
-        "rsi_15m":     d15.get("rsi", ""),  "slope_15m": d15.get("slope", ""),
+        "rsi_15m":     d15.get("rsi", ""),
         "vol_15m":     d15.get("vol_ratio", ""),
-        "rsi_1h":      d1.get("rsi", ""),   "slope_1h":  d1.get("slope", ""),
+        "rsi_1h":      d1.get("rsi", ""),
         "vol_1h":      d1.get("vol_ratio", ""),
         "tendencia_ema": _dir(d1.get("above_ema"),  "ALCISTA", "BAJISTA"),
         "vwap":          _dir(d5.get("above_vwap"), "ARRIBA",  "ABAJO"),
-        "vwma_ok":       _dir(d5.get("vwma_up"),    "SI",      "NO"),
         "precio":      d5.get("price", ""),
     }
     with open(LOG_FILE, "a", newline="", encoding="utf-8-sig") as f:
