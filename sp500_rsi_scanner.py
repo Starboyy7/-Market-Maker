@@ -667,7 +667,6 @@ def build_table(scan_data: dict, last_refresh: dict[str, datetime],
         hidden = 0
         for ticker, tf_data in sorted(scan_data.items()):
             alignment = calc_alignment(ticker, tf_data)
-            log_signal(ticker, alignment.plain, tf_data)
 
             # Show only tickers with something relevant: active alignment
             # signal, extreme RSI condition, or divergence in any TF.
@@ -901,6 +900,9 @@ def run_once(tickers: list[str], use_demo: bool):
     if not scan_data:
         console.print("[yellow]No hay señales activas en este momento.[/yellow]")
         return
+
+    for ticker, tf_data in scan_data.items():
+        log_signal(ticker, calc_alignment(ticker, tf_data).plain, tf_data)
 
     now = datetime.now(ET)
     empty_ts: dict = {}
