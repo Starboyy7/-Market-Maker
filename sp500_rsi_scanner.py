@@ -998,26 +998,66 @@ def run_backtest(tickers: list[str], use_demo: bool):
         )
         return
 
+    # Build close-of-session price map {ticker: last_close}
+    session_close: dict[str, float] = {}
+    for ticker, tfs in data.items():
+        df5 = tfs.get("5min")
+        if df5 is None:
+            continue
+        idx      = pd.to_datetime(df5.index)
+        last_day_data = df5.index[idx.date == last_day]
+        if len(last_day_data):
+            session_close[ticker] = round(float(df5.loc[last_day_data[-1], "Close"]), 4)
+
     table = Table(
         title=f"[bold cyan]Señales del backtest — sesión {last_day}[/bold cyan]",
         box=box.SIMPLE_HEAD,
     )
-    for col in ("Hora ET", "Ticker", "Señal", "Precio",
-                "RSI 5m", "RSI 15m", "RSI 1h"):
+    for col in ("Hora ET", "Ticker", "Señal", "Entrada",
+                "Cierre", "ROI%", "RSI 5m", "RSI 15m", "RSI 1h"):
         table.add_column(col, justify="center")
+
+    wins = losses = 0
+    total_roi = 0.0
     for ev in sorted(events):
         hora, tic, sig, px, r5, r15, r1h = ev
-        style = ("bold green" if sig == "LONG"
-                 else "bold red" if sig == "SHORT" else "yellow")
-        table.add_row(hora, tic, Text(sig, style=style),
-                      str(px), str(r5), str(r15), str(r1h))
+        sig_style = ("bold green" if sig == "LONG"
+                     else "bold red" if sig == "SHORT" else "yellow")
+        close_px = session_close.get(tic)
+        if close_px and sig in ("LONG", "SHORT") and px:
+            roi = ((close_px - px) / px * 100) if sig == "LONG" \
+                  else ((px - close_px) / px * 100)
+            roi = round(roi, 2)
+            total_roi += roi
+            if roi >= 0:
+                wins += 1
+                roi_text = Text(f"+{roi:.2f}%", style="bold green")
+            else:
+                losses += 1
+                roi_text = Text(f"{roi:.2f}%", style="bold red")
+        else:
+            roi_text = Text("—", style="dim")
+            close_px = close_px or "—"
+
+        table.add_row(
+            hora, tic,
+            Text(sig, style=sig_style),
+            str(px), str(close_px), roi_text,
+            str(r5), str(r15), str(r1h),
+        )
     console.print(table)
+
     longs  = sum(1 for e in events if e[2] == "LONG")
     shorts = sum(1 for e in events if e[2] == "SHORT")
     bloqs  = len(events) - longs - shorts
+    traded = wins + losses
+    wr     = f"{wins/traded*100:.0f}%" if traded else "—"
+    avg    = f"{total_roi/traded:+.2f}%" if traded else "—"
     console.print(
         f"\n[bold]Total:[/bold] [green]{longs} LONG[/green]  "
-        f"[red]{shorts} SHORT[/red]  [yellow]{bloqs} BLOQ[/yellow]\n"
+        f"[red]{shorts} SHORT[/red]  [yellow]{bloqs} BLOQ[/yellow]  "
+        f"│  Win rate: [cyan]{wr}[/cyan]  "
+        f"ROI promedio: [cyan]{avg}[/cyan]\n"
     )
 
 
