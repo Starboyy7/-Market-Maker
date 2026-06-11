@@ -567,7 +567,7 @@ def _cell(info: dict) -> Text:
             cell.append("  ↓div", style="bold red")
         cell.append_text(_vol_text(vol_ratio))
         if signal != "—":
-            cell.append(f" {signal}")
+            cell.append(f"\n{signal}")
     else:
         cell.append(f"RSI {rsi_val} {slope}", style="dim")
         cell.append_text(_vol_text(vol_ratio))
