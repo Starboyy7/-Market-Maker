@@ -924,7 +924,7 @@ def run_watch(tickers: list[str], use_demo: bool):
 # ═════════════════════════════════════════════════════════════════════════════
 # Backtest — replay today's session bar by bar
 # ═════════════════════════════════════════════════════════════════════════════
-def run_backtest(tickers: list[str], use_demo: bool):
+def run_backtest(tickers: list[str], use_demo: bool, all_hours: bool = False):
     global _FORCE_OPEN
 
     console.print(
@@ -969,10 +969,9 @@ def run_backtest(tickers: list[str], use_demo: bool):
                 if len(tf_data) < 3:
                     continue
                 sig = calc_alignment(ticker, tf_data).plain
-                # Apply trading-hours filter: only include events 09:50–15:30 ET
                 ts_dt = pd.to_datetime(ts)
                 hm_ts = (ts_dt.hour, ts_dt.minute)
-                in_window = TRADE_START <= hm_ts < TRADE_END
+                in_window = all_hours or (TRADE_START <= hm_ts < TRADE_END)
                 if in_window and (
                     (sig != prev_sig and sig in ("LONG", "SHORT")) or
                     (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
@@ -1126,6 +1125,8 @@ def parse_args():
     p.add_argument("--backtest", action="store_true",
                    help="Replay today's session bar by bar and list the "
                         "LONG/SHORT signals it would have generated.")
+    p.add_argument("--all-hours", action="store_true",
+                   help="With --backtest: include signals outside 09:50–15:30 window.")
     return p.parse_args()
 
 
@@ -1141,7 +1142,7 @@ def main():
         )
 
     if args.backtest:
-        run_backtest(tickers, demo)
+        run_backtest(tickers, demo, all_hours=args.all_hours)
     elif args.watch:
         # Print schedule info before entering live screen
         console.print(
