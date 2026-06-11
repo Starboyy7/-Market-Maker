@@ -74,6 +74,11 @@ TF_SCHEDULE = {
 RSI_PERIOD   = 4   # default (used for display label)
 DIV_LOOKBACK = 20
 
+# Divergence quality filters — weak/stale divergences are ignored
+DIV_MIN_RSI_GAP   = 5.0     # min RSI points between the two extremes
+DIV_MIN_PRICE_PCT = 0.0015  # min price gap between extremes (0.15%)
+DIV_MAX_AGE       = 6       # most recent extreme within N bars
+
 # RSI period per timeframe — entry sensitive, direction stable
 RSI_PERIODS = {"5min": 4, "15min": 7, "1h": 14}
 
@@ -138,6 +143,11 @@ def detect_divergence(price: pd.Series, rsi: pd.Series,
     """
     Bullish : price lower low  + RSI higher low  → BUY setup
     Bearish : price higher high + RSI lower high → SELL setup
+
+    Quality filters (avoid weak/stale divergences):
+      - RSI gap between the two extremes must be >= DIV_MIN_RSI_GAP
+      - price gap must be >= DIV_MIN_PRICE_PCT
+      - the most recent extreme must be within DIV_MAX_AGE bars
     """
     if len(price) < lookback + 5:
         return ""
@@ -145,11 +155,27 @@ def detect_divergence(price: pd.Series, rsi: pd.Series,
     r = rsi.iloc[-lookback:].values
     ph, pl = _local_extremes(p)
     rh, rl = _local_extremes(r)
+
+    last_bar = len(p) - 1
+
     if len(ph) >= 2 and len(rh) >= 2:
-        if p[ph[-1]] > p[ph[-2]] and r[rh[-1]] < r[rh[-2]]:
+        price_gap = (p[ph[-1]] - p[ph[-2]]) / p[ph[-2]]
+        rsi_gap   = r[rh[-2]] - r[rh[-1]]
+        recent    = (last_bar - ph[-1]) <= DIV_MAX_AGE
+        if (p[ph[-1]] > p[ph[-2]] and r[rh[-1]] < r[rh[-2]]
+                and price_gap >= DIV_MIN_PRICE_PCT
+                and rsi_gap   >= DIV_MIN_RSI_GAP
+                and recent):
             return "bearish"
+
     if len(pl) >= 2 and len(rl) >= 2:
-        if p[pl[-1]] < p[pl[-2]] and r[rl[-1]] > r[rl[-2]]:
+        price_gap = (p[pl[-2]] - p[pl[-1]]) / p[pl[-2]]
+        rsi_gap   = r[rl[-1]] - r[rl[-2]]
+        recent    = (last_bar - pl[-1]) <= DIV_MAX_AGE
+        if (p[pl[-1]] < p[pl[-2]] and r[rl[-1]] > r[rl[-2]]
+                and price_gap >= DIV_MIN_PRICE_PCT
+                and rsi_gap   >= DIV_MIN_RSI_GAP
+                and recent):
             return "bullish"
     return ""
 
