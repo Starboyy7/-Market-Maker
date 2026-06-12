@@ -1414,8 +1414,9 @@ def _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi):
     if total_traded == 0:
         return
 
-    global_wr    = total_w / total_traded
-    days_positive = sum(1 for *_, day_roi, _ in day_summary if day_roi > 0)
+    global_wr     = total_w / total_traded
+    # day_summary row: (date, wins, losses, bloqs, day_roi, wr, choppy)
+    days_positive = sum(1 for r in day_summary if float(r[4]) > 0)
     days_negative = len(day_summary) - days_positive
     avg_day_roi   = cum_roi / len(day_summary)
     worst_day     = min(day_summary, key=lambda x: x[4])
@@ -1423,8 +1424,8 @@ def _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi):
     consec_losses = 0
     max_consec    = 0
     streak        = 0
-    for *_, day_roi, _ in day_summary:
-        if day_roi < 0:
+    for r in day_summary:
+        if float(r[4]) < 0:
             streak += 1
             max_consec = max(max_consec, streak)
         else:
