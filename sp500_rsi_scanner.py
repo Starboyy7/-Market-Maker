@@ -94,12 +94,19 @@ VOL_THRESHOLDS: dict[str, float] = {
 }
 VOL_THRESHOLD_DEFAULT = 1.2
 
-# Stop loss en ROI — si el precio va -0.50% en contra, el trade se cierra ahí
-STOP_LOSS_PCT = 0.50
+# Stop loss base — se ajusta por ATR del ticker en backtest
+STOP_LOSS_PCT    = 0.50   # fallback fijo si ATR no disponible
+ATR_STOP_MULT    = 1.5    # stop = ATR(14) en 5min × este multiplicador
+ATR_STOP_MIN_PCT = 0.20   # stop mínimo (tickers muy tranquilos)
+ATR_STOP_MAX_PCT = 0.80   # stop máximo (tickers muy volátiles como NVDA)
 # Trailing stop — se activa solo después de alcanzar +TRAIL_ACTIVATION_PCT;
 # si el precio retrocede TRAIL_STOP_PCT desde el pico, cierra ahí.
 TRAIL_ACTIVATION_PCT = 0.40
 TRAIL_STOP_PCT       = 0.25
+# Régimen de mercado — se filtra usando el rango del SPY en la 1ª hora
+REGIME_RANGE_MIN = 0.40   # si rango SPY < 0.40% en 9:30-10:30, día choppy → no operar
+# Filtro de earnings — no operar el día del reporte ni 1 día antes
+EARNINGS_FILTER = True
 
 # Trading hours filter (ET) — no signals outside this window
 TRADE_START = (9, 50)   # ignore first 20 min of session (noise)
@@ -929,6 +936,87 @@ def run_watch(tickers: list[str], use_demo: bool):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Backtest helpers — ATR stop, regime filter, earnings filter
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _atr_stop_pct(df5: pd.DataFrame, as_of_ts) -> float:
+    """ATR(14) en 5min hasta as_of_ts → stop en % ajustado al ticker."""
+    sliced = df5[df5.index <= as_of_ts].tail(30)
+    if len(sliced) < 5:
+        return STOP_LOSS_PCT
+    high = sliced["High"]
+    low  = sliced["Low"]
+    prev_close = sliced["Close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(span=14, adjust=False).mean().iloc[-1]
+    px  = float(sliced["Close"].iloc[-1])
+    pct = (atr / px * 100) * ATR_STOP_MULT
+    return round(max(ATR_STOP_MIN_PCT, min(ATR_STOP_MAX_PCT, pct)), 3)
+
+
+def _spy_regime(spy_df5: pd.DataFrame | None, session_date) -> bool:
+    """True = día con tendencia (operable). False = día choppy, no operar.
+    Criterio: rango de SPY en barras 9:30-10:30 ET >= REGIME_RANGE_MIN %."""
+    if spy_df5 is None:
+        return True  # sin datos SPY, no filtramos
+    idx = pd.to_datetime(spy_df5.index)
+    day_bars = spy_df5[(idx.date == session_date) &
+                       (idx.hour == 9) | (idx.hour == 10)]
+    # Más preciso: barras entre 9:30 y 10:30
+    day_bars = spy_df5[
+        (pd.to_datetime(spy_df5.index).date == session_date) &
+        (pd.to_datetime(spy_df5.index).hour.isin([9, 10]))
+    ]
+    if len(day_bars) < 4:
+        return True
+    rng = (day_bars["High"].max() - day_bars["Low"].min())
+    open_px = float(day_bars["Open"].iloc[0])
+    rng_pct = rng / open_px * 100
+    return rng_pct >= REGIME_RANGE_MIN
+
+
+def _build_earnings_set(tickers: list[str]) -> set[tuple]:
+    """Descarga calendario de earnings de yfinance.
+    Retorna set de (ticker, date) donde NO se debe operar
+    (día del reporte y día anterior)."""
+    blocked: set[tuple] = set()
+    if not EARNINGS_FILTER:
+        return blocked
+    for tk in tickers:
+        try:
+            cal = yf.Ticker(tk).calendar
+            if cal is None:
+                continue
+            # calendar puede ser dict o DataFrame según versión de yfinance
+            if isinstance(cal, dict):
+                ed = cal.get("Earnings Date")
+                if ed is None:
+                    continue
+                dates = [ed] if not hasattr(ed, "__iter__") else list(ed)
+            elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
+                dates = list(cal["Earnings Date"])
+            elif hasattr(cal, "index") and "Earnings Date" in cal.index:
+                val = cal.loc["Earnings Date"]
+                dates = list(val) if hasattr(val, "__iter__") else [val]
+            else:
+                continue
+            for d in dates:
+                try:
+                    dt = pd.to_datetime(d).date()
+                    blocked.add((tk, dt))
+                    blocked.add((tk, dt - pd.Timedelta(days=1)))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return blocked
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Backtest — replay today's session bar by bar
 # ═════════════════════════════════════════════════════════════════════════════
 def run_backtest(tickers: list[str], use_demo: bool,
@@ -965,6 +1053,20 @@ def run_backtest(tickers: list[str], use_demo: bool,
             if df is not None and not df.empty:
                 data.setdefault(t, {})[tf_name] = df
 
+    # Descarga SPY para filtro de régimen (si no estaba en tickers)
+    spy_df5: pd.DataFrame | None = None
+    if not use_demo:
+        console.print("[dim]Descargando SPY para filtro de régimen…[/dim]")
+        spy_batch = fetch_yfinance_batch(["SPY"], "5m",
+                                         "60d" if days > 5 else "5d")
+        spy_df5 = spy_batch.get("SPY") or data.get("SPY", {}).get("5min")
+
+    # Earnings bloqueados para todo el periodo
+    earnings_blocked: set[tuple] = set()
+    if EARNINGS_FILTER and not use_demo:
+        console.print("[dim]Descargando calendario de earnings…[/dim]")
+        earnings_blocked = _build_earnings_set(tickers)
+
     # Collect all trading days available in the 5min data
     all_days: list = []
     for tfs in data.values():
@@ -976,17 +1078,26 @@ def run_backtest(tickers: list[str], use_demo: bool,
     session_days = all_days[-days:] if days < len(all_days) else all_days
 
     # Per-day results
-    day_summary: list[tuple] = []   # (date, wins, losses, bloqs, roi)
+    day_summary: list[tuple] = []   # (date, wins, losses, bloqs, roi, skipped_regime)
 
     _FORCE_OPEN = True
     try:
         for session_date in session_days:
+            # Filtro de régimen: si SPY no abre con suficiente rango, día choppy
+            if not _spy_regime(spy_df5, session_date):
+                day_summary.append((session_date, 0, 0, 0, 0.0, "—", True))
+                continue
+
             events: list[tuple] = []
 
             for ticker, tfs in sorted(data.items()):
                 df5 = tfs.get("5min")
                 if df5 is None or len(tfs) < 3:
                     continue
+                # Filtro de earnings — saltar ticker si reporta hoy o mañana
+                if (ticker, session_date) in earnings_blocked:
+                    continue
+
                 idx     = pd.to_datetime(df5.index)
                 session = df5.index[idx.date == session_date]
                 if len(session) < 10:
@@ -1010,12 +1121,16 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         (sig != prev_sig and sig in ("LONG", "SHORT")) or
                         (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
                     ):
-                        # Simula el trade barra a barra con stop fijo + trailing stop.
+                        # Simula el trade barra a barra:
+                        #   stop  = ATR(14)×1.5 ajustado al ticker
+                        #   fill  = open de la barra siguiente al stop (realista)
+                        #   trail = activa en +0.40%, cierra si retrocede 0.25% del pico
                         roi30 = roi60 = None
                         if sig in ("LONG", "SHORT"):
-                            px   = tf_data["5min"]["price"]
-                            pos  = df5.index.get_loc(ts)
-                            peak = 0.0        # máxima excursión favorable (%)
+                            px       = tf_data["5min"]["price"]
+                            pos      = df5.index.get_loc(ts)
+                            stop_pct = _atr_stop_pct(df5, ts)
+                            peak     = 0.0
                             exit_roi = None
                             exit_bar = None
 
@@ -1036,15 +1151,22 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                     favorable = (px - lo) / px * 100
                                     close_roi = (px - cl) / px * 100
 
-                                # Stop fijo tiene prioridad
-                                if adverse >= STOP_LOSS_PCT:
-                                    exit_roi = -STOP_LOSS_PCT
+                                # Stop dinámico: fill al open de la barra siguiente
+                                if adverse >= stop_pct:
+                                    if k + 1 < len(df5.index):
+                                        fill = float(df5["Open"].iloc[k + 1])
+                                        exit_roi = round(
+                                            ((fill - px) / px * 100) if sig == "LONG"
+                                            else ((px - fill) / px * 100), 2
+                                        )
+                                    else:
+                                        exit_roi = -stop_pct
                                     exit_bar = bar_n
                                     break
 
                                 peak = max(peak, favorable)
 
-                                # Trailing stop — solo si el pico supera la activación
+                                # Trailing stop
                                 if (peak >= TRAIL_ACTIVATION_PCT and
                                         (peak - favorable) >= TRAIL_STOP_PCT):
                                     exit_roi = round(close_roi, 2)
@@ -1077,7 +1199,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         ))
                     prev_sig = sig
 
-            # Classify events — win/loss based on ROI@60min (fallback 30min)
+            # Classify events — BLOQs se cuentan pero NO se muestran en tabla
             wins = losses = bloqs = 0
             day_roi = 0.0
             ev_rows: list[tuple] = []
@@ -1094,9 +1216,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                     ev_rows.append((hora, tic, sig, px,
                                     roi30, roi60, r5, r15, r1h))
                 else:
-                    bloqs += 1
-                    ev_rows.append((hora, tic, sig, px,
-                                    None, None, r5, r15, r1h))
+                    bloqs += 1  # contado pero no agregado a ev_rows
 
             # Print per-day table only if single day; otherwise just summary
             if days == 1:
@@ -1106,7 +1226,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 traded = wins + losses
                 wr = f"{wins/traded*100:.0f}%" if traded else "—"
                 day_summary.append((session_date, wins, losses, bloqs,
-                                    round(day_roi, 2), wr))
+                                    round(day_roi, 2), wr, False))
     finally:
         _FORCE_OPEN = False
 
@@ -1156,40 +1276,48 @@ def _print_month_summary(day_summary: list[tuple]):
         title="[bold cyan]Backtest — resumen mensual[/bold cyan]",
         box=box.SIMPLE_HEAD,
     )
-    for col in ("Fecha", "Trades", "W", "L", "BLOQ",
-                "Win rate", "ROI@60m día", "ROI@60m acum"):
+    for col in ("Fecha", "Trades", "W", "L",
+                "Win rate", "ROI@60m día", "ROI@60m acum", "Régimen"):
         table.add_column(col, justify="center")
 
     cum_roi = 0.0
     total_w = total_l = total_b = 0
-    for date, wins, losses, bloqs, day_roi, wr in day_summary:
+    choppy_days = 0
+    for row in day_summary:
+        date, wins, losses, bloqs, day_roi, wr = row[:6]
+        choppy = row[6] if len(row) > 6 else False
         cum_roi += day_roi
         total_w += wins
         total_l += losses
         total_b += bloqs
-        traded   = wins + losses
+        if choppy:
+            choppy_days += 1
+        traded    = wins + losses
         roi_style = "bold green" if day_roi >= 0 else "bold red"
         cum_style = "bold green" if cum_roi >= 0 else "bold red"
+        regime_label = Text("CHOPPY", style="dim") if choppy else Text("OK", style="dim green")
         table.add_row(
             str(date),
             str(traded),
-            str(wins), str(losses), str(bloqs),
+            str(wins), str(losses),
             wr,
             Text(f"{day_roi:+.2f}%", style=roi_style),
             Text(f"{cum_roi:+.2f}%", style=cum_style),
+            regime_label,
         )
 
     console.print(table)
     total_traded = total_w + total_l
+    active_days  = len(day_summary) - choppy_days
     global_wr    = f"{total_w/total_traded*100:.0f}%" if total_traded else "—"
-    avg_day      = f"{cum_roi/len(day_summary):+.2f}%" if day_summary else "—"
+    avg_day      = f"{cum_roi/active_days:+.2f}%" if active_days else "—"
     console.print(
         f"\n[bold]TOTAL:[/bold]  {total_traded} trades  "
         f"[green]{total_w}W[/green] [red]{total_l}L[/red]  "
-        f"[yellow]{total_b} BLOQ[/yellow]  "
         f"│  Win rate global: [cyan]{global_wr}[/cyan]  "
         f"ROI acumulado: [cyan]{cum_roi:+.2f}%[/cyan]  "
-        f"Promedio/día: [cyan]{avg_day}[/cyan]\n"
+        f"Promedio/día activo: [cyan]{avg_day}[/cyan]  "
+        f"[dim]Días choppy filtrados: {choppy_days}[/dim]\n"
     )
     _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi)
 
