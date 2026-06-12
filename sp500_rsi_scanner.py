@@ -12,6 +12,7 @@ Watch mode refresh schedule (--watch):
   1h    → every 1 hour
 """
 
+import bisect
 import csv
 import argparse
 import random
@@ -1036,6 +1037,21 @@ def _spy_vwap_series(spy_df5: pd.DataFrame, session_date) -> pd.Series:
     return day_bars["_vwap"]
 
 
+def _spy_vwap_dict(spy_df5: pd.DataFrame | None,
+                   session_date) -> tuple[dict, list]:
+    """Devuelve (dict {ts: (close, vwap)}, sorted_keys) para lookup O(log n)."""
+    if spy_df5 is None:
+        return {}, []
+    series = _spy_vwap_series(spy_df5, session_date)
+    if series.empty:
+        return {}, []
+    closes = spy_df5["Close"]
+    result = {}
+    for ts, vwap in series.items():
+        result[ts] = (float(closes.get(ts, vwap)), float(vwap))
+    return result, sorted(result.keys())
+
+
 def _spy_regime(spy_df5: pd.DataFrame | None, session_date) -> bool:
     """True = día con tendencia (operable). False = día choppy, no operar.
     Criterio: rango de SPY en barras 9:30-10:30 ET >= REGIME_RANGE_MIN %."""
@@ -1151,11 +1167,23 @@ def run_backtest(tickers: list[str], use_demo: bool,
             _spy = data.get("SPY", {}).get("5min")
         spy_df5 = _spy
 
-    # Earnings bloqueados para todo el periodo
+    # Earnings bloqueados — cacheados en disco 24h (cambian poco)
     earnings_blocked: set[tuple] = set()
     if EARNINGS_FILTER and not use_demo:
-        console.print("[dim]Descargando calendario de earnings…[/dim]")
-        earnings_blocked = _build_earnings_set(tickers)
+        earn_cache = CACHE_DIR / "earnings.pkl"
+        if not force_fresh and earn_cache.exists():
+            age_h = (datetime.now() - datetime.fromtimestamp(
+                earn_cache.stat().st_mtime)).total_seconds() / 3600
+            if age_h < 24:
+                _ec = _cache_load(earn_cache)
+                if _ec is not None:
+                    earnings_blocked = _ec
+        if not earnings_blocked:
+            console.print("[dim]Descargando calendario de earnings…[/dim]")
+            earnings_blocked = _build_earnings_set(tickers)
+            _cache_save(earn_cache, earnings_blocked)
+        else:
+            console.print("[dim]Earnings — cargando desde cache…[/dim]")
 
     # Collect all trading days available in the 5min data
     all_days: list = []
@@ -1178,9 +1206,8 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 day_summary.append((session_date, 0, 0, 0, 0.0, "—", True))
                 continue
 
-            # VWAP del SPY para el día — filtro de dirección macro (Rec 3)
-            spy_vwap_s = _spy_vwap_series(spy_df5, session_date) \
-                         if spy_df5 is not None else pd.Series(dtype=float)
+            # VWAP del SPY precalculado para lookup O(log n) en el loop
+            spy_vwap_d, spy_vwap_keys = _spy_vwap_dict(spy_df5, session_date)
 
             events: list[tuple] = []
 
@@ -1215,13 +1242,15 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
                     ):
                         # ── Rec 3: LONG solo si SPY > VWAP; SHORT si SPY < VWAP ──
-                        if sig in ("LONG", "SHORT") and not spy_vwap_s.empty:
-                            spv_idx = spy_vwap_s.index[spy_vwap_s.index <= ts]
-                            if len(spv_idx) > 0:
-                                ref_ts = spv_idx[-1]
-                                spy_vwap_val  = float(spy_vwap_s.loc[ref_ts])
-                                spy_close_val = float(spy_df5["Close"].loc[ref_ts]) \
-                                    if ref_ts in spy_df5.index else spy_vwap_val
+                        if sig in ("LONG", "SHORT") and spy_vwap_keys:
+                            spy_entry = spy_vwap_d.get(ts)
+                            if spy_entry is None:
+                                # bisect: O(log n) para encontrar último ts ≤ ts
+                                i = bisect.bisect_right(spy_vwap_keys, ts) - 1
+                                if i >= 0:
+                                    spy_entry = spy_vwap_d[spy_vwap_keys[i]]
+                            if spy_entry is not None:
+                                spy_close_val, spy_vwap_val = spy_entry
                                 spy_above = spy_close_val >= spy_vwap_val
                                 if sig == "LONG" and not spy_above:
                                     prev_sig = sig
