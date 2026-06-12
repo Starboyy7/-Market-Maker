@@ -96,6 +96,10 @@ VOL_THRESHOLD_DEFAULT = 1.2
 
 # Stop loss en ROI — si el precio va -0.50% en contra, el trade se cierra ahí
 STOP_LOSS_PCT = 0.50
+# Trailing stop — se activa solo después de alcanzar +TRAIL_ACTIVATION_PCT;
+# si el precio retrocede TRAIL_STOP_PCT desde el pico, cierra ahí.
+TRAIL_ACTIVATION_PCT = 0.40
+TRAIL_STOP_PCT       = 0.25
 
 # Trading hours filter (ET) — no signals outside this window
 TRADE_START = (9, 50)   # ignore first 20 min of session (noise)
@@ -1006,36 +1010,62 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         (sig != prev_sig and sig in ("LONG", "SHORT")) or
                         (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
                     ):
-                        # Entry-quality metric: ROI at +30min and +60min
-                        # (6 and 12 bars of 5min ahead), not at session close.
+                        # Simula el trade barra a barra con stop fijo + trailing stop.
                         roi30 = roi60 = None
                         if sig in ("LONG", "SHORT"):
-                            px  = tf_data["5min"]["price"]
-                            pos = df5.index.get_loc(ts)
+                            px   = tf_data["5min"]["price"]
+                            pos  = df5.index.get_loc(ts)
+                            peak = 0.0        # máxima excursión favorable (%)
+                            exit_roi = None
+                            exit_bar = None
 
-                            def _roi_at(n_bars: int):
-                                j = pos + n_bars
-                                if j >= len(df5.index):
-                                    return None
-                                if pd.to_datetime(df5.index[j]).date() != session_date:
-                                    return None
-                                # Stop loss: si en alguna barra intermedia el
-                                # precio fue -STOP_LOSS_PCT% en contra, el
-                                # trade cerró ahí.
-                                for k in range(pos + 1, j + 1):
-                                    if sig == "LONG":
-                                        adverse = (px - float(df5["Low"].iloc[k])) / px * 100
-                                    else:
-                                        adverse = (float(df5["High"].iloc[k]) - px) / px * 100
-                                    if adverse >= STOP_LOSS_PCT:
-                                        return -STOP_LOSS_PCT
-                                fp = float(df5["Close"].iloc[j])
-                                r  = ((fp - px) / px * 100) if sig == "LONG" \
-                                     else ((px - fp) / px * 100)
-                                return round(r, 2)
+                            for k in range(pos + 1, min(pos + 13, len(df5.index))):
+                                if pd.to_datetime(df5.index[k]).date() != session_date:
+                                    break
+                                hi = float(df5["High"].iloc[k])
+                                lo = float(df5["Low"].iloc[k])
+                                cl = float(df5["Close"].iloc[k])
+                                bar_n = k - pos  # 1..12
 
-                            roi30 = _roi_at(6)
-                            roi60 = _roi_at(12)
+                                if sig == "LONG":
+                                    adverse   = (px - lo) / px * 100
+                                    favorable = (hi - px) / px * 100
+                                    close_roi = (cl - px) / px * 100
+                                else:
+                                    adverse   = (hi - px) / px * 100
+                                    favorable = (px - lo) / px * 100
+                                    close_roi = (px - cl) / px * 100
+
+                                # Stop fijo tiene prioridad
+                                if adverse >= STOP_LOSS_PCT:
+                                    exit_roi = -STOP_LOSS_PCT
+                                    exit_bar = bar_n
+                                    break
+
+                                peak = max(peak, favorable)
+
+                                # Trailing stop — solo si el pico supera la activación
+                                if (peak >= TRAIL_ACTIVATION_PCT and
+                                        (peak - favorable) >= TRAIL_STOP_PCT):
+                                    exit_roi = round(close_roi, 2)
+                                    exit_bar = bar_n
+                                    break
+
+                                if bar_n == 6:
+                                    roi30 = round(close_roi, 2)
+
+                            if exit_roi is not None:
+                                if exit_bar is not None and exit_bar <= 6:
+                                    roi30 = exit_roi
+                                roi60 = exit_roi
+                            else:
+                                j = pos + 12
+                                if (j < len(df5.index) and
+                                        pd.to_datetime(df5.index[j]).date() == session_date):
+                                    cl = float(df5["Close"].iloc[j])
+                                    r  = ((cl - px) / px * 100) if sig == "LONG" \
+                                         else ((px - cl) / px * 100)
+                                    roi60 = round(r, 2)
 
                         events.append((
                             ts_dt.strftime("%H:%M"), ticker, sig,
