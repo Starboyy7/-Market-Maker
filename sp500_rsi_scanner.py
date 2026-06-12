@@ -108,6 +108,11 @@ REGIME_RANGE_MIN = 0.40   # si rango SPY < 0.40% en 9:30-10:30, día choppy → 
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
 EARNINGS_FILTER = True
 
+# Cache de datos — evita re-descargar en cada backtest
+CACHE_DIR = Path("cache")
+# El cache se invalida automáticamente después de las 20:00 ET (mercado cerrado)
+CACHE_MAX_AGE_HOURS = 4   # durante el día, refresca cada 4h como máximo
+
 # Trading hours filter (ET) — no signals outside this window
 TRADE_START = (9, 50)   # ignore first 20 min of session (noise)
 TRADE_END   = (15, 30)  # no new entries in last 30 min
@@ -470,6 +475,62 @@ def fetch_demo(ticker: str, interval: str, period: str,
         "Open": open_, "High": close + spread, "Low": close - spread,
         "Close": close, "Volume": volume,
     }, index=idx)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Cache de datos en disco
+# ═════════════════════════════════════════════════════════════════════════════
+def _cache_path(interval: str, period: str) -> Path:
+    CACHE_DIR.mkdir(exist_ok=True)
+    return CACHE_DIR / f"{interval}_{period}.pkl"
+
+
+def _cache_valid(path: Path) -> bool:
+    if not path.exists():
+        return False
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    age_h = (datetime.now() - mtime).total_seconds() / 3600
+    if age_h > CACHE_MAX_AGE_HOURS:
+        return False
+    return True
+
+
+def _cache_save(path: Path, data: dict[str, pd.DataFrame]) -> None:
+    try:
+        import pickle
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass
+
+
+def _cache_load(path: Path) -> dict[str, pd.DataFrame] | None:
+    try:
+        import pickle
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def fetch_batch_cached(tickers: list[str], interval: str, period: str,
+                       force_fresh: bool = False) -> dict[str, pd.DataFrame]:
+    """Batch download con cache en disco. Reutiliza datos si tienen < CACHE_MAX_AGE_HOURS."""
+    path = _cache_path(interval, period)
+    if not force_fresh and _cache_valid(path):
+        cached = _cache_load(path)
+        if cached is not None:
+            # Devuelve solo los tickers pedidos que estén en el cache
+            result = {t: cached[t] for t in tickers if t in cached}
+            if result:
+                return result
+    batch = fetch_yfinance_batch(tickers, interval, period)
+    if batch:
+        # Fusiona con cache existente para no perder tickers previos
+        existing = _cache_load(path) or {}
+        existing.update(batch)
+        _cache_save(path, existing)
+    return batch
 
 
 def fetch_ohlcv(ticker: str, interval: str, period: str,
@@ -1020,7 +1081,8 @@ def _build_earnings_set(tickers: list[str]) -> set[tuple]:
 # Backtest — replay today's session bar by bar
 # ═════════════════════════════════════════════════════════════════════════════
 def run_backtest(tickers: list[str], use_demo: bool,
-                 all_hours: bool = False, days: int = 1):
+                 all_hours: bool = False, days: int = 1,
+                 force_fresh: bool = False):
     global _FORCE_OPEN
 
     # For multi-day we need more history — use max allowed by yfinance for 5min (60d)
@@ -1037,15 +1099,19 @@ def run_backtest(tickers: list[str], use_demo: bool,
         f"[dim]Reproduce cada sesión vela a vela (5min).[/dim]\n"
     )
 
-    # Download full data once per timeframe
+    # Download full data — usa cache si está disponible
     data: dict[str, dict[str, pd.DataFrame]] = {}
     for tf_name in TIMEFRAMES:
-        console.print(f"[dim]Descargando {tf_name}…[/dim]")
         interval = bt_intervals[tf_name]
         period   = bt_periods[tf_name]
         batch: dict[str, pd.DataFrame] = {}
         if not use_demo:
-            batch = fetch_yfinance_batch(tickers, interval, period)
+            path = _cache_path(interval, period)
+            if not force_fresh and _cache_valid(path):
+                console.print(f"[dim]{tf_name} — cargando desde cache…[/dim]")
+            else:
+                console.print(f"[dim]{tf_name} — descargando…[/dim]")
+            batch = fetch_batch_cached(tickers, interval, period, force_fresh)
         for t in tickers:
             df = batch.get(t)
             if df is None:
@@ -1053,12 +1119,16 @@ def run_backtest(tickers: list[str], use_demo: bool,
             if df is not None and not df.empty:
                 data.setdefault(t, {})[tf_name] = df
 
-    # Descarga SPY para filtro de régimen (si no estaba en tickers)
+    # SPY para filtro de régimen — también cacheado
     spy_df5: pd.DataFrame | None = None
     if not use_demo:
-        console.print("[dim]Descargando SPY para filtro de régimen…[/dim]")
-        spy_batch = fetch_yfinance_batch(["SPY"], "5m",
-                                         "60d" if days > 5 else "5d")
+        spy_period = "60d" if days > 5 else "5d"
+        spy_path   = _cache_path("5m", spy_period)
+        if not force_fresh and _cache_valid(spy_path):
+            console.print("[dim]SPY — cargando desde cache…[/dim]")
+        else:
+            console.print("[dim]SPY — descargando para filtro de régimen…[/dim]")
+        spy_batch = fetch_batch_cached(["SPY"], "5m", spy_period, force_fresh)
         _spy = spy_batch.get("SPY")
         if _spy is None or _spy.empty:
             _spy = data.get("SPY", {}).get("5min")
@@ -1564,6 +1634,8 @@ def parse_args():
     p.add_argument("--days", type=int, default=1,
                    help="With --backtest: number of sessions to replay (max ~42). "
                         "Use --days 22 for ~1 month.")
+    p.add_argument("--fresh", action="store_true",
+                   help="Ignora el cache y descarga datos nuevos de yfinance.")
     return p.parse_args()
 
 
@@ -1579,7 +1651,8 @@ def main():
         )
 
     if args.backtest:
-        run_backtest(tickers, demo, all_hours=args.all_hours, days=args.days)
+        run_backtest(tickers, demo, all_hours=args.all_hours, days=args.days,
+                     force_fresh=args.fresh)
     elif args.watch:
         # Print schedule info before entering live screen
         console.print(
