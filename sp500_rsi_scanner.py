@@ -1059,7 +1059,10 @@ def run_backtest(tickers: list[str], use_demo: bool,
         console.print("[dim]Descargando SPY para filtro de régimen…[/dim]")
         spy_batch = fetch_yfinance_batch(["SPY"], "5m",
                                          "60d" if days > 5 else "5d")
-        spy_df5 = spy_batch.get("SPY") or data.get("SPY", {}).get("5min")
+        _spy = spy_batch.get("SPY")
+        if _spy is None or _spy.empty:
+            _spy = data.get("SPY", {}).get("5min")
+        spy_df5 = _spy
 
     # Earnings bloqueados para todo el periodo
     earnings_blocked: set[tuple] = set()
