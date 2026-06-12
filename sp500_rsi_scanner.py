@@ -89,10 +89,13 @@ EMA_PERIOD  = 50   # EMA on 1h closes — macro trend filter
 
 # Relative volume thresholds — signal requires vol_ratio >= threshold
 VOL_THRESHOLDS: dict[str, float] = {
-    "NVDA": 1.3, "TSLA": 1.3,
-    "AAPL": 1.5, "AMZN": 1.5, "AMD": 1.5,
+    "NVDA": 1.2, "TSLA": 1.2,
+    "AAPL": 1.2, "AMZN": 1.2, "AMD": 1.2,
 }
-VOL_THRESHOLD_DEFAULT = 1.5
+VOL_THRESHOLD_DEFAULT = 1.2
+
+# Stop loss en ROI — si el precio va -0.50% en contra, el trade se cierra ahí
+STOP_LOSS_PCT = 0.50
 
 # Trading hours filter (ET) — no signals outside this window
 TRADE_START = (9, 50)   # ignore first 20 min of session (noise)
@@ -1016,6 +1019,16 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                     return None
                                 if pd.to_datetime(df5.index[j]).date() != session_date:
                                     return None
+                                # Stop loss: si en alguna barra intermedia el
+                                # precio fue -STOP_LOSS_PCT% en contra, el
+                                # trade cerró ahí.
+                                for k in range(pos + 1, j + 1):
+                                    if sig == "LONG":
+                                        adverse = (px - float(df5["Low"].iloc[k])) / px * 100
+                                    else:
+                                        adverse = (float(df5["High"].iloc[k]) - px) / px * 100
+                                    if adverse >= STOP_LOSS_PCT:
+                                        return -STOP_LOSS_PCT
                                 fp = float(df5["Close"].iloc[j])
                                 r  = ((fp - px) / px * 100) if sig == "LONG" \
                                      else ((px - fp) / px * 100)
