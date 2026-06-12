@@ -1094,13 +1094,14 @@ def _print_day_table(session_date, ev_rows, wins, losses, bloqs, day_roi):
                       str(r5), str(r15), str(r1h))
     console.print(table)
     console.print(
-        f"\n[bold]Total:[/bold] [green]{wins+losses-losses+losses} trades[/green]  "
+        f"\n[bold]Total:[/bold] [green]{wins+losses} trades[/green]  "
         f"[green]{wins}W[/green] [red]{losses}L[/red]  "
         f"[yellow]{bloqs} BLOQ[/yellow]  "
         f"│  Win rate: [cyan]{wr}[/cyan]  "
         f"ROI acum: [cyan]{day_roi:+.2f}%[/cyan]  "
         f"ROI promedio: [cyan]{avg}[/cyan]\n"
     )
+    _trader_advice_single(ev_rows, wins, losses, bloqs, day_roi)
 
 
 def _print_month_summary(day_summary: list[tuple]):
@@ -1142,6 +1143,181 @@ def _print_month_summary(day_summary: list[tuple]):
         f"│  Win rate global: [cyan]{global_wr}[/cyan]  "
         f"ROI acumulado: [cyan]{cum_roi:+.2f}%[/cyan]  "
         f"Promedio/día: [cyan]{avg_day}[/cyan]\n"
+    )
+    _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Trader algorítmico — análisis experto contextual
+# ═════════════════════════════════════════════════════════════════════════════
+def _trader_advice_single(ev_rows, wins, losses, bloqs, day_roi):
+    traded = wins + losses
+    if traded == 0:
+        return
+    wr = wins / traded
+
+    longs  = [(r, roi) for *_, sig, _, _, roi, *__ in
+              [(*e,) for e in ev_rows] if len(e) >= 6
+              for r, roi in [(e[2], e[5])] if r == "LONG" and roi is not None]
+    shorts = [(r, roi) for *_, sig, _, _, roi, *__ in
+              [(*e,) for e in ev_rows] if len(e) >= 6
+              for r, roi in [(e[2], e[5])] if r == "SHORT" and roi is not None]
+
+    long_rois  = [e[5] for e in ev_rows if e[2] == "LONG"  and e[5] is not None]
+    short_rois = [e[5] for e in ev_rows if e[2] == "SHORT" and e[5] is not None]
+    long_wr    = sum(1 for r in long_rois  if r > 0) / len(long_rois)  if long_rois  else None
+    short_wr   = sum(1 for r in short_rois if r > 0) / len(short_rois) if short_rois else None
+    avg_win    = sum(r for r in long_rois + short_rois if r > 0) / max(wins, 1)
+    avg_loss   = sum(r for r in long_rois + short_rois if r < 0) / max(losses, 1)
+    rr         = abs(avg_win / avg_loss) if avg_loss != 0 else float("inf")
+
+    late_rois  = [e[5] for e in ev_rows
+                  if e[5] is not None and e[0] >= "15:00"]
+    early_rois = [e[5] for e in ev_rows
+                  if e[5] is not None and e[0] < "11:00"]
+
+    lines: list[str] = []
+
+    # Win rate
+    if wr >= 0.75:
+        lines.append(f"✅  Win rate de {wr*100:.0f}% — sistema alineado con el mercado hoy. "
+                     "Mantén la disciplina, no amplíes el tamaño de posición por euforia.")
+    elif wr >= 0.55:
+        lines.append(f"⚠️  Win rate de {wr*100:.0f}% — aceptable pero mejorable. "
+                     "Revisa si las pérdidas se concentran en un horario o en LONGs/SHORTs específicos.")
+    else:
+        lines.append(f"🔴  Win rate de {wr*100:.0f}% — por debajo del umbral mínimo viable (55%). "
+                     "Este día el sistema operó contra la tendencia dominante. No escales capital.")
+
+    # Long vs Short sesgo
+    if long_wr is not None and short_wr is not None:
+        if long_wr < 0.40 and short_wr > 0.65:
+            lines.append("📉  Los LONGs fallaron consistentemente mientras los SHORTs ganaron. "
+                         "El mercado tenía sesgo bajista — considera agregar un filtro de tendencia "
+                         "macro (SPY/QQQ por encima o debajo de su EMA diaria) antes de permitir LONGs.")
+        elif short_wr < 0.40 and long_wr > 0.65:
+            lines.append("📈  Los SHORTs fallaron consistentemente mientras los LONGs ganaron. "
+                         "Mercado con sesgo alcista fuerte — el filtro de VWAP está subvalorando el momentum.")
+        elif long_wr < 0.50 and short_wr < 0.50:
+            lines.append("⚠️  Ni LONGs ni SHORTs funcionaron bien hoy — día lateral o volátil sin dirección. "
+                         "En este contexto el sistema genera ruido. Considera pausar si SPY cae <0.3% "
+                         "y sube <0.3% en las primeras 2 horas.")
+
+    # Risk/Reward
+    if rr < 1.0 and losses > 0:
+        lines.append(f"🔺  Risk/Reward implícito: {rr:.2f}R — estás ganando menos de lo que pierdes por trade. "
+                     "Con stop en 1R y objetivo en 2R este sistema sería rentable incluso con 40% win rate. "
+                     "Es la mejora de mayor impacto pendiente.")
+    elif rr >= 1.5:
+        lines.append(f"✅  R/R implícito de {rr:.2f}R — las ganancias superan las pérdidas. "
+                     "Cuando implementes gestión de riesgo, un objetivo de 1.5R–2R es consistente con lo visto.")
+
+    # Señales tardías
+    if late_rois and sum(late_rois) < 0:
+        lines.append("🕒  Las señales después de las 15:00 ET tuvieron ROI negativo acumulado. "
+                     "Con gestión de riesgo real (stop) muchas de estas serían stop out antes del cierre. "
+                     "Considera adelantar el TRADE_END a 15:00 y evaluar el impacto.")
+
+    # Señales tempranas
+    if early_rois and len(early_rois) >= 2:
+        early_wr = sum(1 for r in early_rois if r > 0) / len(early_rois)
+        if early_wr < 0.40:
+            lines.append("⏰  Las primeras señales del día (antes de las 11:00 ET) tuvieron bajo win rate. "
+                         "La liquidez y el price discovery de apertura generan falsos positivos — "
+                         "considera retrasar TRADE_START a 10:00 ET.")
+
+    # BLOQs
+    if bloqs > traded:
+        lines.append(f"🚫  {bloqs} BLOQs vs {traded} trades operados — el detector de divergencias "
+                     "sigue siendo conservador. Si los BLOQs corresponden a setups que habrían ganado, "
+                     "considera reducir DIV_MIN_RSI_GAP de 5 a 4.")
+
+    _render_advice(lines)
+
+
+def _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi):
+    if not day_summary:
+        return
+    total_traded  = total_w + total_l
+    if total_traded == 0:
+        return
+
+    global_wr    = total_w / total_traded
+    days_positive = sum(1 for *_, day_roi, _ in day_summary if day_roi > 0)
+    days_negative = len(day_summary) - days_positive
+    avg_day_roi   = cum_roi / len(day_summary)
+    worst_day     = min(day_summary, key=lambda x: x[4])
+    best_day      = max(day_summary, key=lambda x: x[4])
+    consec_losses = 0
+    max_consec    = 0
+    streak        = 0
+    for *_, day_roi, _ in day_summary:
+        if day_roi < 0:
+            streak += 1
+            max_consec = max(max_consec, streak)
+        else:
+            streak = 0
+
+    lines: list[str] = []
+
+    # ROI acumulado
+    if cum_roi > 0:
+        lines.append(f"✅  ROI acumulado mensual: {cum_roi:+.2f}% con {global_wr*100:.0f}% win rate global. "
+                     f"Sistema rentable en muestra de {len(day_summary)} sesiones — estadísticamente significativo.")
+    else:
+        lines.append(f"🔴  ROI mensual negativo ({cum_roi:+.2f}%). "
+                     "Antes de operar capital real necesitas al menos 3 meses con ROI positivo consistente.")
+
+    # Consistencia diaria
+    if days_positive / len(day_summary) >= 0.65:
+        lines.append(f"✅  {days_positive}/{len(day_summary)} días positivos — alta consistencia diaria. "
+                     "El sistema no depende de un solo día extraordinario.")
+    elif days_negative > days_positive:
+        lines.append(f"⚠️  Más días negativos ({days_negative}) que positivos ({days_positive}). "
+                     "El ROI positivo viene de pocos días con muchos trades ganadores — "
+                     "distribución frágil. Investiga qué condiciones macro diferenciaron los días positivos.")
+
+    # Peor día
+    if worst_day[4] < -3.0:
+        lines.append(f"🔺  Peor día: {worst_day[0]} con {worst_day[4]:+.2f}%. "
+                     "Un stop diario de -2% habría limitado ese daño y mejorado el ROI mensual. "
+                     "Regla estándar: si el día llega a -2% acumulado, parar.")
+
+    # Racha perdedora
+    if max_consec >= 3:
+        lines.append(f"⚠️  Racha máxima de {max_consec} días consecutivos negativos. "
+                     "Con 3+ días en rojo seguidos el sistema probablemente está operando "
+                     "en condiciones de mercado que no son su entorno óptimo (alta volatilidad macro, "
+                     "earnings season, etc.). Considera un circuit breaker automático.")
+
+    # Promedio diario
+    if avg_day_roi > 0.5:
+        lines.append(f"📈  Promedio de {avg_day_roi:+.2f}% por día — con gestión de riesgo "
+                     "y compounding conservador (1% de capital por trade) esto proyecta "
+                     "retornos mensuales significativos sin riesgo de ruina.")
+    elif 0 < avg_day_roi <= 0.5:
+        lines.append(f"📊  Promedio de {avg_day_roi:+.2f}% por día — marginal sin gestión de riesgo. "
+                     "La implementación de stop loss transformaría esta métrica al cortar pérdidas "
+                     "que actualmente arrastran el promedio al final de sesión.")
+
+    _render_advice(lines)
+
+
+def _render_advice(lines: list[str]):
+    if not lines:
+        return
+    body = Text()
+    for i, line in enumerate(lines):
+        body.append(line)
+        if i < len(lines) - 1:
+            body.append("\n\n")
+    console.print(
+        Panel(
+            body,
+            title="[bold yellow]⚡ Trader Algorítmico[/bold yellow]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
     )
 
 
