@@ -101,10 +101,15 @@ ATR_STOP_MIN_PCT = 0.20   # stop mínimo (tickers muy tranquilos)
 ATR_STOP_MAX_PCT = 0.80   # stop máximo (tickers muy volátiles como NVDA)
 # Trailing stop — se activa solo después de alcanzar +TRAIL_ACTIVATION_PCT;
 # si el precio retrocede TRAIL_STOP_PCT desde el pico, cierra ahí.
+# Take profit escalonado: 50% sale en TRAIL_ACTIVATION_PCT, 50% corre con trailing.
 TRAIL_ACTIVATION_PCT = 0.40
 TRAIL_STOP_PCT       = 0.25
 # Régimen de mercado — se filtra usando el rango del SPY en la 1ª hora
-REGIME_RANGE_MIN = 0.40   # si rango SPY < 0.40% en 9:30-10:30, día choppy → no operar
+REGIME_RANGE_MIN = 0.55   # subido de 0.40 → 0.55 para filtrar más días choppy
+# Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
+CIRCUIT_BREAKER_PCT = -1.5
+# Filtro de inactividad: si no hubo señal antes de las 13:00 ET, no operar después
+NO_EARLY_SIGNAL_CUTOFF = (13, 0)
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
 EARNINGS_FILTER = True
 
@@ -1019,6 +1024,18 @@ def _atr_stop_pct(df5: pd.DataFrame, as_of_ts) -> float:
     return round(max(ATR_STOP_MIN_PCT, min(ATR_STOP_MAX_PCT, pct)), 3)
 
 
+def _spy_vwap_series(spy_df5: pd.DataFrame, session_date) -> pd.Series:
+    """VWAP acumulado del SPY barra a barra para la sesión dada."""
+    idx      = pd.to_datetime(spy_df5.index)
+    day_bars = spy_df5[idx.date == session_date].copy()
+    if day_bars.empty or "Volume" not in day_bars.columns:
+        return pd.Series(dtype=float)
+    typical          = (day_bars["High"] + day_bars["Low"] + day_bars["Close"]) / 3
+    day_bars["_tpv"] = typical * day_bars["Volume"]
+    day_bars["_vwap"] = day_bars["_tpv"].cumsum() / day_bars["Volume"].cumsum()
+    return day_bars["_vwap"]
+
+
 def _spy_regime(spy_df5: pd.DataFrame | None, session_date) -> bool:
     """True = día con tendencia (operable). False = día choppy, no operar.
     Criterio: rango de SPY en barras 9:30-10:30 ET >= REGIME_RANGE_MIN %."""
@@ -1156,10 +1173,14 @@ def run_backtest(tickers: list[str], use_demo: bool,
     _FORCE_OPEN = True
     try:
         for session_date in session_days:
-            # Filtro de régimen: si SPY no abre con suficiente rango, día choppy
+            # ── Rec 1: Filtro de régimen (umbral subido a 0.55%) ─────────────
             if not _spy_regime(spy_df5, session_date):
                 day_summary.append((session_date, 0, 0, 0, 0.0, "—", True))
                 continue
+
+            # VWAP del SPY para el día — filtro de dirección macro (Rec 3)
+            spy_vwap_s = _spy_vwap_series(spy_df5, session_date) \
+                         if spy_df5 is not None else pd.Series(dtype=float)
 
             events: list[tuple] = []
 
@@ -1167,7 +1188,6 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 df5 = tfs.get("5min")
                 if df5 is None or len(tfs) < 3:
                     continue
-                # Filtro de earnings — saltar ticker si reporta hoy o mañana
                 if (ticker, session_date) in earnings_blocked:
                     continue
 
@@ -1194,26 +1214,43 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         (sig != prev_sig and sig in ("LONG", "SHORT")) or
                         (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
                     ):
+                        # ── Rec 3: LONG solo si SPY > VWAP; SHORT si SPY < VWAP ──
+                        if sig in ("LONG", "SHORT") and not spy_vwap_s.empty:
+                            spv_idx = spy_vwap_s.index[spy_vwap_s.index <= ts]
+                            if len(spv_idx) > 0:
+                                ref_ts = spv_idx[-1]
+                                spy_vwap_val  = float(spy_vwap_s.loc[ref_ts])
+                                spy_close_val = float(spy_df5["Close"].loc[ref_ts]) \
+                                    if ref_ts in spy_df5.index else spy_vwap_val
+                                spy_above = spy_close_val >= spy_vwap_val
+                                if sig == "LONG" and not spy_above:
+                                    prev_sig = sig
+                                    continue
+                                if sig == "SHORT" and spy_above:
+                                    prev_sig = sig
+                                    continue
+
                         # Simula el trade barra a barra:
-                        #   stop  = ATR(14)×1.5 ajustado al ticker
-                        #   fill  = open de la barra siguiente al stop (realista)
-                        #   trail = activa en +0.40%, cierra si retrocede 0.25% del pico
+                        #   stop      = ATR(14)×1.5 ajustado al ticker
+                        #   fill stop = open de la barra siguiente (realista)
+                        #   Rec 4     = take profit 50% en +0.40%, 50% con trailing
                         roi30 = roi60 = None
                         if sig in ("LONG", "SHORT"):
-                            px       = tf_data["5min"]["price"]
-                            pos      = df5.index.get_loc(ts)
-                            stop_pct = _atr_stop_pct(df5, ts)
-                            peak     = 0.0
-                            exit_roi = None
-                            exit_bar = None
+                            px            = tf_data["5min"]["price"]
+                            pos           = df5.index.get_loc(ts)
+                            stop_pct      = _atr_stop_pct(df5, ts)
+                            peak          = 0.0
+                            exit_roi      = None
+                            exit_bar      = None
+                            half_exit_roi = None  # primera mitad TP en +0.40%
 
                             for k in range(pos + 1, min(pos + 13, len(df5.index))):
                                 if pd.to_datetime(df5.index[k]).date() != session_date:
                                     break
-                                hi = float(df5["High"].iloc[k])
-                                lo = float(df5["Low"].iloc[k])
-                                cl = float(df5["Close"].iloc[k])
-                                bar_n = k - pos  # 1..12
+                                hi    = float(df5["High"].iloc[k])
+                                lo    = float(df5["Low"].iloc[k])
+                                cl    = float(df5["Close"].iloc[k])
+                                bar_n = k - pos
 
                                 if sig == "LONG":
                                     adverse   = (px - lo) / px * 100
@@ -1224,25 +1261,32 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                     favorable = (px - lo) / px * 100
                                     close_roi = (px - cl) / px * 100
 
-                                # Stop dinámico: fill al open de la barra siguiente
                                 if adverse >= stop_pct:
                                     if k + 1 < len(df5.index):
                                         fill = float(df5["Open"].iloc[k + 1])
-                                        exit_roi = round(
+                                        stop_exit = round(
                                             ((fill - px) / px * 100) if sig == "LONG"
-                                            else ((px - fill) / px * 100), 2
-                                        )
+                                            else ((px - fill) / px * 100), 2)
                                     else:
-                                        exit_roi = -stop_pct
+                                        stop_exit = -stop_pct
+                                    exit_roi = round(
+                                        (half_exit_roi + stop_exit) / 2, 2
+                                    ) if half_exit_roi is not None else stop_exit
                                     exit_bar = bar_n
                                     break
 
                                 peak = max(peak, favorable)
 
-                                # Trailing stop
+                                # Rec 4: TP 50% cuando close_roi supera activación
+                                if half_exit_roi is None and close_roi >= TRAIL_ACTIVATION_PCT:
+                                    half_exit_roi = TRAIL_ACTIVATION_PCT
+
                                 if (peak >= TRAIL_ACTIVATION_PCT and
                                         (peak - favorable) >= TRAIL_STOP_PCT):
-                                    exit_roi = round(close_roi, 2)
+                                    second = round(close_roi, 2)
+                                    exit_roi = round(
+                                        (half_exit_roi + second) / 2, 2
+                                    ) if half_exit_roi is not None else second
                                     exit_bar = bar_n
                                     break
 
@@ -1258,9 +1302,12 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                 if (j < len(df5.index) and
                                         pd.to_datetime(df5.index[j]).date() == session_date):
                                     cl = float(df5["Close"].iloc[j])
-                                    r  = ((cl - px) / px * 100) if sig == "LONG" \
-                                         else ((px - cl) / px * 100)
-                                    roi60 = round(r, 2)
+                                    time_exit = round(
+                                        ((cl - px) / px * 100) if sig == "LONG"
+                                        else ((px - cl) / px * 100), 2)
+                                    roi60 = round(
+                                        (half_exit_roi + time_exit) / 2, 2
+                                    ) if half_exit_roi is not None else time_exit
 
                         events.append((
                             ts_dt.strftime("%H:%M"), ticker, sig,
@@ -1272,12 +1319,31 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         ))
                     prev_sig = sig
 
-            # Classify events — BLOQs se cuentan pero NO se muestran en tabla
+            # Classify events en orden cronológico:
+            # Rec 2: circuit breaker -1.5% acumulado → cerrar día
+            # Rec 5: si no hubo señal antes de 13:00, ignorar trades tardíos
             wins = losses = bloqs = 0
-            day_roi = 0.0
+            day_roi      = 0.0
             ev_rows: list[tuple] = []
+            circuit_open = True
+            had_early_signal = any(
+                ev[2] in ("LONG", "SHORT") and ev[0] < "13:00"
+                for ev in events
+            )
+
             for ev in sorted(events):
                 hora, tic, sig, px, roi30, roi60, r5, r15, r1h = ev
+
+                # Rec 5: sin señal temprana, ignorar trades ≥ 13:00
+                if sig in ("LONG", "SHORT") and not had_early_signal and hora >= "13:00":
+                    bloqs += 1
+                    continue
+
+                # Rec 2: circuit breaker activo
+                if sig in ("LONG", "SHORT") and not circuit_open:
+                    bloqs += 1
+                    continue
+
                 if sig in ("LONG", "SHORT"):
                     roi_eval = roi60 if roi60 is not None else roi30
                     if roi_eval is not None:
@@ -1286,10 +1352,12 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             wins += 1
                         else:
                             losses += 1
+                        if day_roi <= CIRCUIT_BREAKER_PCT:
+                            circuit_open = False
                     ev_rows.append((hora, tic, sig, px,
                                     roi30, roi60, r5, r15, r1h))
                 else:
-                    bloqs += 1  # contado pero no agregado a ev_rows
+                    bloqs += 1
 
             # Print per-day table only if single day; otherwise just summary
             if days == 1:
