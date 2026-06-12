@@ -1003,48 +1003,53 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         (sig != prev_sig and sig in ("LONG", "SHORT")) or
                         (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
                     ):
+                        # Entry-quality metric: ROI at +30min and +60min
+                        # (6 and 12 bars of 5min ahead), not at session close.
+                        roi30 = roi60 = None
+                        if sig in ("LONG", "SHORT"):
+                            px  = tf_data["5min"]["price"]
+                            pos = df5.index.get_loc(ts)
+
+                            def _roi_at(n_bars: int):
+                                j = pos + n_bars
+                                if j >= len(df5.index):
+                                    return None
+                                if pd.to_datetime(df5.index[j]).date() != session_date:
+                                    return None
+                                fp = float(df5["Close"].iloc[j])
+                                r  = ((fp - px) / px * 100) if sig == "LONG" \
+                                     else ((px - fp) / px * 100)
+                                return round(r, 2)
+
+                            roi30 = _roi_at(6)
+                            roi60 = _roi_at(12)
+
                         events.append((
                             ts_dt.strftime("%H:%M"), ticker, sig,
                             tf_data["5min"]["price"],
+                            roi30, roi60,
                             tf_data["5min"]["rsi"],
                             tf_data.get("15min", {}).get("rsi", ""),
                             tf_data.get("1h", {}).get("rsi", ""),
                         ))
                     prev_sig = sig
 
-            # Session close prices for this day
-            session_close: dict[str, float] = {}
-            for ticker, tfs in data.items():
-                df5 = tfs.get("5min")
-                if df5 is None:
-                    continue
-                day_bars = df5.index[pd.to_datetime(df5.index).date == session_date]
-                if len(day_bars):
-                    session_close[ticker] = round(
-                        float(df5.loc[day_bars[-1], "Close"]), 4)
-
-            # Calculate ROI per event
+            # Classify events — win/loss based on ROI@60min (fallback 30min)
             wins = losses = bloqs = 0
             day_roi = 0.0
             ev_rows: list[tuple] = []
             for ev in sorted(events):
-                hora, tic, sig, px, r5, r15, r1h = ev
-                if sig in ("LONG", "SHORT") and px:
-                    close_px = session_close.get(tic)
-                    if close_px:
-                        roi = ((close_px - px) / px * 100) if sig == "LONG" \
-                              else ((px - close_px) / px * 100)
-                        roi = round(roi, 2)
-                        day_roi += roi
-                        if roi >= 0:
+                hora, tic, sig, px, roi30, roi60, r5, r15, r1h = ev
+                if sig in ("LONG", "SHORT"):
+                    roi_eval = roi60 if roi60 is not None else roi30
+                    if roi_eval is not None:
+                        day_roi += roi_eval
+                        if roi_eval >= 0:
                             wins += 1
                         else:
                             losses += 1
-                        ev_rows.append((hora, tic, sig, px,
-                                        close_px, roi, r5, r15, r1h))
-                    else:
-                        ev_rows.append((hora, tic, sig, px,
-                                        None, None, r5, r15, r1h))
+                    ev_rows.append((hora, tic, sig, px,
+                                    roi30, roi60, r5, r15, r1h))
                 else:
                     bloqs += 1
                     ev_rows.append((hora, tic, sig, px,
@@ -1076,21 +1081,20 @@ def _print_day_table(session_date, ev_rows, wins, losses, bloqs, day_roi):
         box=box.SIMPLE_HEAD,
     )
     for col in ("Hora ET", "Ticker", "Señal", "Entrada",
-                "Cierre", "ROI%", "RSI 5m", "RSI 15m", "RSI 1h"):
+                "ROI+30m", "ROI+60m", "RSI 5m", "RSI 15m", "RSI 1h"):
         table.add_column(col, justify="center")
 
-    for hora, tic, sig, px, close_px, roi, r5, r15, r1h in ev_rows:
+    def _roi_cell(roi):
+        if roi is None:
+            return Text("—", style="dim")
+        return Text(f"+{roi:.2f}%" if roi >= 0 else f"{roi:.2f}%",
+                    style="bold green" if roi >= 0 else "bold red")
+
+    for hora, tic, sig, px, roi30, roi60, r5, r15, r1h in ev_rows:
         sig_style = ("bold green" if sig == "LONG"
                      else "bold red" if sig == "SHORT" else "yellow")
-        if roi is not None and sig in ("LONG", "SHORT"):
-            roi_text = Text(f"+{roi:.2f}%" if roi >= 0 else f"{roi:.2f}%",
-                            style="bold green" if roi >= 0 else "bold red")
-            cp_str = str(close_px)
-        else:
-            roi_text = Text("—", style="dim")
-            cp_str   = str(close_px) if close_px else "—"
         table.add_row(hora, tic, Text(sig, style=sig_style),
-                      str(px), cp_str, roi_text,
+                      str(px), _roi_cell(roi30), _roi_cell(roi60),
                       str(r5), str(r15), str(r1h))
     console.print(table)
     console.print(
@@ -1098,8 +1102,8 @@ def _print_day_table(session_date, ev_rows, wins, losses, bloqs, day_roi):
         f"[green]{wins}W[/green] [red]{losses}L[/red]  "
         f"[yellow]{bloqs} BLOQ[/yellow]  "
         f"│  Win rate: [cyan]{wr}[/cyan]  "
-        f"ROI acum: [cyan]{day_roi:+.2f}%[/cyan]  "
-        f"ROI promedio: [cyan]{avg}[/cyan]\n"
+        f"ROI@60m acum: [cyan]{day_roi:+.2f}%[/cyan]  "
+        f"ROI@60m promedio: [cyan]{avg}[/cyan]\n"
     )
     _trader_advice_single(ev_rows, wins, losses, bloqs, day_roi)
 
@@ -1110,7 +1114,7 @@ def _print_month_summary(day_summary: list[tuple]):
         box=box.SIMPLE_HEAD,
     )
     for col in ("Fecha", "Trades", "W", "L", "BLOQ",
-                "Win rate", "ROI día", "ROI acum"):
+                "Win rate", "ROI@60m día", "ROI@60m acum"):
         table.add_column(col, justify="center")
 
     cum_roi = 0.0
@@ -1156,13 +1160,7 @@ def _trader_advice_single(ev_rows, wins, losses, bloqs, day_roi):
         return
     wr = wins / traded
 
-    longs  = [(r, roi) for *_, sig, _, _, roi, *__ in
-              [(*e,) for e in ev_rows] if len(e) >= 6
-              for r, roi in [(e[2], e[5])] if r == "LONG" and roi is not None]
-    shorts = [(r, roi) for *_, sig, _, _, roi, *__ in
-              [(*e,) for e in ev_rows] if len(e) >= 6
-              for r, roi in [(e[2], e[5])] if r == "SHORT" and roi is not None]
-
+    # e = (hora, ticker, señal, entrada, roi30, roi60, rsi5, rsi15, rsi1h)
     long_rois  = [e[5] for e in ev_rows if e[2] == "LONG"  and e[5] is not None]
     short_rois = [e[5] for e in ev_rows if e[2] == "SHORT" and e[5] is not None]
     long_wr    = sum(1 for r in long_rois  if r > 0) / len(long_rois)  if long_rois  else None
