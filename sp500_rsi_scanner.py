@@ -106,13 +106,13 @@ ATR_STOP_MAX_PCT = 0.80   # stop máximo (tickers muy volátiles como NVDA)
 TRAIL_ACTIVATION_PCT = 0.40
 TRAIL_STOP_PCT       = 0.25
 # Régimen de mercado — se filtra usando el rango del SPY en la 1ª hora
-REGIME_RANGE_MIN = 0.55   # subido de 0.40 → 0.55 para filtrar más días choppy
+REGIME_RANGE_MIN = 0.45   # bajado de 0.55 — filtraba demasiados días
 # Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
 CIRCUIT_BREAKER_PCT = -1.5
 # Filtro de inactividad: si no hubo señal antes de las 13:00 ET, no operar después
 NO_EARLY_SIGNAL_CUTOFF = (13, 0)
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
-EARNINGS_FILTER = True
+EARNINGS_FILTER = False
 
 # Cache de datos — evita re-descargar en cada backtest
 CACHE_DIR = Path("cache")
