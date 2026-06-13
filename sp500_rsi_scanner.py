@@ -1211,6 +1211,10 @@ def run_backtest(tickers: list[str], use_demo: bool,
 
             events: list[tuple] = []
 
+            # Precomputa rango de fechas del día para slicing rápido por ticker
+            day_start = pd.Timestamp(session_date)
+            day_end   = day_start + pd.Timedelta(days=1)
+
             for ticker, tfs in sorted(data.items()):
                 df5 = tfs.get("5min")
                 if df5 is None or len(tfs) < 3:
@@ -1218,8 +1222,10 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 if (ticker, session_date) in earnings_blocked:
                     continue
 
-                idx     = pd.to_datetime(df5.index)
-                session = df5.index[idx.date == session_date]
+                # searchsorted en lugar de máscara booleana para encontrar el día
+                i0 = df5.index.searchsorted(day_start, side="left")
+                i1 = df5.index.searchsorted(day_end,   side="left")
+                session = df5.index[i0:i1]
                 if len(session) < 10:
                     continue
 
@@ -1227,7 +1233,8 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 for ts in session:
                     tf_data: dict = {}
                     for tf_name, df in tfs.items():
-                        sliced = df[df.index <= ts]
+                        pos_tf = df.index.searchsorted(ts, side="right")
+                        sliced = df.iloc[:pos_tf]
                         info   = _analyze_df(sliced, tf_name)
                         if info is not None:
                             tf_data[tf_name] = info
