@@ -1211,8 +1211,11 @@ def run_backtest(tickers: list[str], use_demo: bool,
 
             events: list[tuple] = []
 
-            # Precomputa rango de fechas del día para slicing rápido por ticker
-            day_start = pd.Timestamp(session_date)
+            # Precomputa rango de fechas del día — detecta timezone del índice
+            _sample_idx = next(
+                (tfs["5min"].index for tfs in data.values() if "5min" in tfs), None)
+            _tz = getattr(_sample_idx, "tz", None) if _sample_idx is not None else None
+            day_start = pd.Timestamp(session_date, tz=_tz)
             day_end   = day_start + pd.Timedelta(days=1)
 
             for ticker, tfs in sorted(data.items()):
