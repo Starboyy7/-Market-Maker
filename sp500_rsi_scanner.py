@@ -97,20 +97,26 @@ VOL_THRESHOLD_DEFAULT = 1.2
 
 # Stop loss base — se ajusta por ATR del ticker en backtest
 STOP_LOSS_PCT    = 0.50   # fallback fijo si ATR no disponible
-ATR_STOP_MULT    = 1.5    # stop = ATR(14) en 5min × este multiplicador
+ATR_STOP_MULT    = 1.5    # multiplicador ATR por defecto
+# Multiplicador ATR por ticker — los monstruos volátiles necesitan más aire
+ATR_STOP_MULT_BY_TICKER: dict[str, float] = {
+    "NVDA": 2.0, "TSLA": 2.0, "AMD": 1.8,
+}
 ATR_STOP_MIN_PCT = 0.20   # stop mínimo (tickers muy tranquilos)
-ATR_STOP_MAX_PCT = 0.80   # stop máximo (tickers muy volátiles como NVDA)
-# Trailing stop — se activa solo después de alcanzar +TRAIL_ACTIVATION_PCT;
-# si el precio retrocede TRAIL_STOP_PCT desde el pico, cierra ahí.
-# Take profit escalonado: 50% sale en TRAIL_ACTIVATION_PCT, 50% corre con trailing.
+ATR_STOP_MAX_PCT = 1.20   # stop máximo (subido por los multiplicadores altos)
+# Trailing stop — se activa tras alcanzar +TRAIL_ACTIVATION_PCT;
+# si el precio retrocede TRAIL_STOP_PCT desde el pico, cierra.
+# Take profit escalonado: 50% sale en TRAIL_ACTIVATION_PCT, 50% corre con
+# trailing hasta TRADE_END (30 min antes del cierre, evita gaps overnight).
 TRAIL_ACTIVATION_PCT = 0.40
 TRAIL_STOP_PCT       = 0.25
+# Filtro VWAP del SPY (Opción A — banda muerta):
+# solo bloquea si el SPY está claramente lejos del VWAP. Pegado al VWAP no filtra.
+SPY_VWAP_BAND_PCT = 0.15
 # Régimen de mercado — se filtra usando el rango del SPY en la 1ª hora
 REGIME_RANGE_MIN = 0.45   # bajado de 0.55 — filtraba demasiados días
 # Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
 CIRCUIT_BREAKER_PCT = -1.5
-# Filtro de inactividad: si no hubo señal antes de las 13:00 ET, no operar después
-NO_EARLY_SIGNAL_CUTOFF = (13, 0)
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
 EARNINGS_FILTER = False
 
@@ -1006,9 +1012,10 @@ def run_watch(tickers: list[str], use_demo: bool):
 # Backtest helpers — ATR stop, regime filter, earnings filter
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _atr_stop_pct(df5: pd.DataFrame, as_of_ts) -> float:
-    """ATR(14) en 5min hasta as_of_ts → stop en % ajustado al ticker."""
-    sliced = df5[df5.index <= as_of_ts].tail(30)
+def _atr_stop_pct(df5: pd.DataFrame, as_of_ts, ticker: str = "") -> float:
+    """ATR(14) en 5min hasta as_of_ts → stop en % con multiplicador por ticker."""
+    pos    = df5.index.searchsorted(as_of_ts, side="right")
+    sliced = df5.iloc[max(0, pos - 30):pos]
     if len(sliced) < 5:
         return STOP_LOSS_PCT
     high = sliced["High"]
@@ -1019,9 +1026,10 @@ def _atr_stop_pct(df5: pd.DataFrame, as_of_ts) -> float:
         (high - prev_close).abs(),
         (low  - prev_close).abs(),
     ], axis=1).max(axis=1)
-    atr = tr.ewm(span=14, adjust=False).mean().iloc[-1]
-    px  = float(sliced["Close"].iloc[-1])
-    pct = (atr / px * 100) * ATR_STOP_MULT
+    atr  = tr.ewm(span=14, adjust=False).mean().iloc[-1]
+    px   = float(sliced["Close"].iloc[-1])
+    mult = ATR_STOP_MULT_BY_TICKER.get(ticker, ATR_STOP_MULT)
+    pct  = (atr / px * 100) * mult
     return round(max(ATR_STOP_MIN_PCT, min(ATR_STOP_MAX_PCT, pct)), 3)
 
 
@@ -1251,45 +1259,53 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         (sig != prev_sig and sig in ("LONG", "SHORT")) or
                         (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
                     ):
-                        # ── Rec 3: LONG solo si SPY > VWAP; SHORT si SPY < VWAP ──
+                        # ── Filtro VWAP SPY (Opción A — banda muerta) ──
+                        # Solo bloquea si el SPY está claramente lejos del VWAP.
+                        # Pegado al VWAP (±SPY_VWAP_BAND_PCT) no filtra: día indeciso,
+                        # deja que la señal del ticker decida.
                         if sig in ("LONG", "SHORT") and spy_vwap_keys:
                             spy_entry = spy_vwap_d.get(ts)
                             if spy_entry is None:
-                                # bisect: O(log n) para encontrar último ts ≤ ts
                                 i = bisect.bisect_right(spy_vwap_keys, ts) - 1
                                 if i >= 0:
                                     spy_entry = spy_vwap_d[spy_vwap_keys[i]]
                             if spy_entry is not None:
                                 spy_close_val, spy_vwap_val = spy_entry
-                                spy_above = spy_close_val >= spy_vwap_val
-                                if sig == "LONG" and not spy_above:
+                                # distancia del SPY a su VWAP en %
+                                spy_dist = (spy_close_val - spy_vwap_val) / spy_vwap_val * 100
+                                # LONG bloqueado solo si SPY claramente bajo VWAP
+                                if sig == "LONG" and spy_dist < -SPY_VWAP_BAND_PCT:
                                     prev_sig = sig
                                     continue
-                                if sig == "SHORT" and spy_above:
+                                # SHORT bloqueado solo si SPY claramente sobre VWAP
+                                if sig == "SHORT" and spy_dist > SPY_VWAP_BAND_PCT:
                                     prev_sig = sig
                                     continue
 
                         # Simula el trade barra a barra:
-                        #   stop      = ATR(14)×1.5 ajustado al ticker
-                        #   fill stop = open de la barra siguiente (realista)
-                        #   Rec 4     = take profit 50% en +0.40%, 50% con trailing
+                        #   stop  = ATR(14)×mult por ticker, fill al open siguiente
+                        #   TP    = 50% sale en +0.40%
+                        #   resto = trailing stop hasta TRADE_END (15:30 ET) — sin
+                        #           gaps overnight. roi60 = ROI realizado del trade.
                         roi30 = roi60 = None
                         if sig in ("LONG", "SHORT"):
                             px            = tf_data["5min"]["price"]
                             pos           = df5.index.get_loc(ts)
-                            stop_pct      = _atr_stop_pct(df5, ts)
+                            stop_pct      = _atr_stop_pct(df5, ts, ticker)
                             peak          = 0.0
                             exit_roi      = None
                             exit_bar      = None
                             half_exit_roi = None  # primera mitad TP en +0.40%
 
-                            for k in range(pos + 1, min(pos + 13, len(df5.index))):
-                                if pd.to_datetime(df5.index[k]).date() != session_date:
+                            for k in range(pos + 1, i1):  # i1 = fin de sesión
+                                k_dt = pd.to_datetime(df5.index[k])
+                                if k_dt.date() != session_date:
                                     break
                                 hi    = float(df5["High"].iloc[k])
                                 lo    = float(df5["Low"].iloc[k])
                                 cl    = float(df5["Close"].iloc[k])
                                 bar_n = k - pos
+                                forced_close = (k_dt.hour, k_dt.minute) >= TRADE_END
 
                                 if sig == "LONG":
                                     adverse   = (px - lo) / px * 100
@@ -1300,6 +1316,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                     favorable = (px - lo) / px * 100
                                     close_roi = (px - cl) / px * 100
 
+                                # Stop: si TP ya tomado, solo afecta la mitad restante
                                 if adverse >= stop_pct:
                                     if k + 1 < len(df5.index):
                                         fill = float(df5["Open"].iloc[k + 1])
@@ -1316,12 +1333,22 @@ def run_backtest(tickers: list[str], use_demo: bool,
 
                                 peak = max(peak, favorable)
 
-                                # Rec 4: TP 50% cuando close_roi supera activación
+                                # TP 50% al superar la activación
                                 if half_exit_roi is None and close_roi >= TRAIL_ACTIVATION_PCT:
                                     half_exit_roi = TRAIL_ACTIVATION_PCT
 
+                                # Trailing del resto (solo activo si superó activación)
                                 if (peak >= TRAIL_ACTIVATION_PCT and
                                         (peak - favorable) >= TRAIL_STOP_PCT):
+                                    second = round(close_roi, 2)
+                                    exit_roi = round(
+                                        (half_exit_roi + second) / 2, 2
+                                    ) if half_exit_roi is not None else second
+                                    exit_bar = bar_n
+                                    break
+
+                                # Cierre forzado 30 min antes del cierre de bolsa
+                                if forced_close:
                                     second = round(close_roi, 2)
                                     exit_roi = round(
                                         (half_exit_roi + second) / 2, 2
@@ -1337,9 +1364,9 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                     roi30 = exit_roi
                                 roi60 = exit_roi
                             else:
-                                j = pos + 12
-                                if (j < len(df5.index) and
-                                        pd.to_datetime(df5.index[j]).date() == session_date):
+                                # Sin salida hasta el final de los datos disponibles
+                                j = min(pos + 12, len(df5.index) - 1)
+                                if pd.to_datetime(df5.index[j]).date() == session_date:
                                     cl = float(df5["Close"].iloc[j])
                                     time_exit = round(
                                         ((cl - px) / px * 100) if sig == "LONG"
@@ -1359,26 +1386,16 @@ def run_backtest(tickers: list[str], use_demo: bool,
                     prev_sig = sig
 
             # Classify events en orden cronológico:
-            # Rec 2: circuit breaker -1.5% acumulado → cerrar día
-            # Rec 5: si no hubo señal antes de 13:00, ignorar trades tardíos
+            # circuit breaker -1.5% acumulado → cerrar día
             wins = losses = bloqs = 0
             day_roi      = 0.0
             ev_rows: list[tuple] = []
             circuit_open = True
-            had_early_signal = any(
-                ev[2] in ("LONG", "SHORT") and ev[0] < "13:00"
-                for ev in events
-            )
 
             for ev in sorted(events):
                 hora, tic, sig, px, roi30, roi60, r5, r15, r1h = ev
 
-                # Rec 5: sin señal temprana, ignorar trades ≥ 13:00
-                if sig in ("LONG", "SHORT") and not had_early_signal and hora >= "13:00":
-                    bloqs += 1
-                    continue
-
-                # Rec 2: circuit breaker activo
+                # Circuit breaker activo: no más trades el resto del día
                 if sig in ("LONG", "SHORT") and not circuit_open:
                     bloqs += 1
                     continue
