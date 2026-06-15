@@ -1208,6 +1208,8 @@ def run_backtest(tickers: list[str], use_demo: bool,
 
     # Per-day results
     day_summary: list[tuple] = []   # (date, wins, losses, bloqs, roi, skipped_regime)
+    # Atribución de pérdidas: (date, ticker, sig, roi, motivo_salida)
+    loss_records: list[tuple] = []
 
     _FORCE_OPEN = True
     try:
@@ -1298,6 +1300,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             peak          = 0.0
                             exit_roi      = None
                             exit_bar      = None
+                            exit_reason   = None  # STOP / TRAIL / FORZADO / TIEMPO
                             half_exit_roi = None  # primera mitad TP en +0.40%
 
                             for k in range(pos + 1, i1):  # i1 = fin de sesión
@@ -1332,6 +1335,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                         (half_exit_roi + stop_exit) / 2, 2
                                     ) if half_exit_roi is not None else stop_exit
                                     exit_bar = bar_n
+                                    exit_reason = "STOP"
                                     break
 
                                 peak = max(peak, favorable)
@@ -1348,6 +1352,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                         (half_exit_roi + second) / 2, 2
                                     ) if half_exit_roi is not None else second
                                     exit_bar = bar_n
+                                    exit_reason = "TRAIL"
                                     break
 
                                 # Cierre forzado 30 min antes del cierre de bolsa
@@ -1357,6 +1362,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                         (half_exit_roi + second) / 2, 2
                                     ) if half_exit_roi is not None else second
                                     exit_bar = bar_n
+                                    exit_reason = "FORZADO"
                                     break
 
                                 if bar_n == 6:
@@ -1377,6 +1383,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                     roi60 = round(
                                         (half_exit_roi + time_exit) / 2, 2
                                     ) if half_exit_roi is not None else time_exit
+                                    exit_reason = "TIEMPO"
 
                         events.append((
                             ts_dt.strftime("%H:%M"), ticker, sig,
@@ -1385,6 +1392,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             tf_data["5min"]["rsi"],
                             tf_data.get("15min", {}).get("rsi", ""),
                             tf_data.get("1h", {}).get("rsi", ""),
+                            exit_reason if sig in ("LONG", "SHORT") else "",
                         ))
                     prev_sig = sig
 
@@ -1396,7 +1404,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
             circuit_open = True
 
             for ev in sorted(events):
-                hora, tic, sig, px, roi30, roi60, r5, r15, r1h = ev
+                hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo = ev
 
                 # Circuit breaker activo: no más trades el resto del día
                 if sig in ("LONG", "SHORT") and not circuit_open:
@@ -1411,10 +1419,12 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             wins += 1
                         else:
                             losses += 1
+                            loss_records.append(
+                                (session_date, tic, sig, roi_eval, motivo or "?"))
                         if day_roi <= CIRCUIT_BREAKER_PCT:
                             circuit_open = False
                     ev_rows.append((hora, tic, sig, px,
-                                    roi30, roi60, r5, r15, r1h))
+                                    roi30, roi60, r5, r15, r1h, motivo))
                 else:
                     bloqs += 1
 
@@ -1432,6 +1442,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
 
     if days > 1:
         _print_month_summary(day_summary)
+        _print_loss_attribution(day_summary, loss_records)
 
 
 def _print_day_table(session_date, ev_rows, wins, losses, bloqs, day_roi):
@@ -1444,7 +1455,7 @@ def _print_day_table(session_date, ev_rows, wins, losses, bloqs, day_roi):
         box=box.SIMPLE_HEAD,
     )
     for col in ("Hora ET", "Ticker", "Señal", "Entrada",
-                "ROI+30m", "ROI+60m", "RSI 5m", "RSI 15m", "RSI 1h"):
+                "ROI+30m", "ROI+60m", "RSI 5m", "RSI 15m", "RSI 1h", "Salida"):
         table.add_column(col, justify="center")
 
     def _roi_cell(roi):
@@ -1453,12 +1464,12 @@ def _print_day_table(session_date, ev_rows, wins, losses, bloqs, day_roi):
         return Text(f"+{roi:.2f}%" if roi >= 0 else f"{roi:.2f}%",
                     style="bold green" if roi >= 0 else "bold red")
 
-    for hora, tic, sig, px, roi30, roi60, r5, r15, r1h in ev_rows:
+    for hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo in ev_rows:
         sig_style = ("bold green" if sig == "LONG"
                      else "bold red" if sig == "SHORT" else "yellow")
         table.add_row(hora, tic, Text(sig, style=sig_style),
                       str(px), _roi_cell(roi30), _roi_cell(roi60),
-                      str(r5), str(r15), str(r1h))
+                      str(r5), str(r15), str(r1h), str(motivo or "—"))
     console.print(table)
     console.print(
         f"\n[bold]Total:[/bold] [green]{wins+losses} trades[/green]  "
@@ -1520,6 +1531,63 @@ def _print_month_summary(day_summary: list[tuple]):
         f"[dim]Días choppy filtrados: {choppy_days}[/dim]\n"
     )
     _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi)
+
+
+def _print_loss_attribution(day_summary, loss_records):
+    """Diagnóstico: ¿de dónde vienen las pérdidas?
+    Desglosa los días negativos, el ticker que más sangró y el motivo de
+    salida (STOP / TRAIL / FORZADO / TIEMPO) para detectar patrones."""
+    if not loss_records:
+        return
+
+    # Días negativos peores (los que más arrastran el ROI total)
+    neg_days = sorted(
+        [(r[0], r[4]) for r in day_summary if len(r) > 4 and r[4] < 0],
+        key=lambda x: x[1],
+    )
+    if neg_days:
+        t = Table(
+            title="[bold red]Atribución de pérdidas — días negativos[/bold red]",
+            box=box.SIMPLE_HEAD,
+        )
+        for col in ("Fecha", "ROI día", "Trades perdedores",
+                    "Tickers que sangraron", "Motivos de salida"):
+            t.add_column(col, justify="left")
+        for date, roi in neg_days:
+            day_losses = [r for r in loss_records if r[0] == date]
+            tick_pl: dict[str, float] = {}
+            reason_ct: dict[str, int] = {}
+            for _, tic, _sig, rl, mot in day_losses:
+                tick_pl[tic]   = tick_pl.get(tic, 0.0) + rl
+                reason_ct[mot] = reason_ct.get(mot, 0) + 1
+            tick_str = ", ".join(
+                f"{k} ({v:+.2f}%)"
+                for k, v in sorted(tick_pl.items(), key=lambda x: x[1])[:4])
+            reason_str = ", ".join(f"{k}×{v}" for k, v in
+                                   sorted(reason_ct.items(), key=lambda x: -x[1]))
+            t.add_row(str(date),
+                      Text(f"{roi:+.2f}%", style="bold red"),
+                      str(len(day_losses)), tick_str, reason_str)
+        console.print(t)
+
+    # Agregado global: ticker y motivo de salida que más pesan
+    tick_total: dict[str, float] = {}
+    reason_total: dict[str, list] = {}
+    for _, tic, _sig, rl, mot in loss_records:
+        tick_total[tic] = tick_total.get(tic, 0.0) + rl
+        reason_total.setdefault(mot, [0, 0.0])
+        reason_total[mot][0] += 1
+        reason_total[mot][1] += rl
+
+    worst_ticks = sorted(tick_total.items(), key=lambda x: x[1])[:6]
+    tick_line = "  ".join(f"{k} {v:+.2f}%" for k, v in worst_ticks)
+    reason_line = "  ".join(
+        f"{k}: {c} trades ({s:+.2f}%)"
+        for k, (c, s) in sorted(reason_total.items(), key=lambda x: x[1][1]))
+    console.print(
+        f"\n[bold]Tickers que más pérdida acumulan:[/bold] [red]{tick_line}[/red]")
+    console.print(
+        f"[bold]Pérdida por motivo de salida:[/bold] [red]{reason_line}[/red]\n")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
