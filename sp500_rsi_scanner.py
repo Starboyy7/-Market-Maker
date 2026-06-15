@@ -114,7 +114,7 @@ TRAIL_STOP_PCT       = 0.25
 # solo bloquea si el SPY está claramente lejos del VWAP. Pegado al VWAP no filtra.
 SPY_VWAP_BAND_PCT = 0.15
 # Régimen de mercado — se filtra usando el rango del SPY en la 1ª hora
-REGIME_RANGE_MIN = 0.50   # probando 0.50 — filtrar más días negativos sin tocar positivos
+REGIME_RANGE_MIN = 0.45   # mejor resultado en backtest: +8.04% ROI vs +6.40% con 0.50%
 # Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
 CIRCUIT_BREAKER_PCT = -1.5
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
