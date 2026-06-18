@@ -128,8 +128,6 @@ REGIME_RANGE_MIN = 0.45   # mejor resultado en backtest: +8.04% ROI vs +6.40% co
 SPY_DIR_MIN_PCT = 0.20
 # Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
 CIRCUIT_BREAKER_PCT = -1.5
-# Circuit breaker por conteo: tras N pérdidas en el día, se cierra el día entero
-MAX_DAILY_LOSSES = 3
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
 EARNINGS_FILTER = False
 
@@ -1549,10 +1547,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             losses += 1
                             loss_records.append(
                                 (session_date, tic, sig, roi_eval, motivo or "?"))
-                        # Cierra el día si ROI acumulado toca el límite
-                        # O si acumulamos demasiadas pérdidas individuales
-                        if (day_roi <= CIRCUIT_BREAKER_PCT or
-                                losses >= MAX_DAILY_LOSSES):
+                        if day_roi <= CIRCUIT_BREAKER_PCT:
                             circuit_open = False
                     ev_rows.append((hora, tic, sig, px,
                                     roi30, roi60, r5, r15, r1h, motivo))
@@ -1718,7 +1713,32 @@ def _print_loss_attribution(day_summary, loss_records):
     console.print(
         f"\n[bold]Tickers que más pérdida acumulan:[/bold] [red]{tick_line}[/red]")
     console.print(
-        f"[bold]Pérdida por motivo de salida:[/bold] [red]{reason_line}[/red]\n")
+        f"[bold]Pérdida por motivo de salida:[/bold] [red]{reason_line}[/red]")
+
+    # Peor stop loss por ticker — cuánto puede perder cada uno en el peor caso
+    stop_losses = [(tic, rl) for _, tic, _sig, rl, mot in loss_records
+                   if mot == "STOP"]
+    if stop_losses:
+        tick_worst: dict[str, float] = {}
+        tick_count: dict[str, int]   = {}
+        for tic, rl in stop_losses:
+            if tic not in tick_worst or rl < tick_worst[tic]:
+                tick_worst[tic] = rl
+            tick_count[tic] = tick_count.get(tic, 0) + 1
+
+        st = Table(
+            title="[bold yellow]Peor stop loss por ticker[/bold yellow]",
+            box=box.SIMPLE_HEAD,
+        )
+        for col in ("Ticker", "Peor stop (ROI)", "Veces parado"):
+            st.add_column(col, justify="center")
+        for tic, worst in sorted(tick_worst.items(), key=lambda x: x[1])[:15]:
+            st.add_row(
+                tic,
+                Text(f"{worst:+.2f}%", style="bold red"),
+                str(tick_count[tic]),
+            )
+        console.print(st)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
