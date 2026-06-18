@@ -128,9 +128,6 @@ REGIME_RANGE_MIN = 0.45   # mejor resultado en backtest: +8.04% ROI vs +6.40% co
 SPY_DIR_MIN_PCT = 0.20
 # Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
 CIRCUIT_BREAKER_PCT = -1.5
-# Freno de racha: 2 pérdidas consecutivas → pausa de N minutos antes de volver a entrar
-CONSEC_LOSS_MAX     = 2
-CONSEC_LOSS_PAUSE_M = 30
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
 EARNINGS_FILTER = False
 
@@ -1047,91 +1044,6 @@ def _atr_stop_pct(df5: pd.DataFrame, as_of_ts, ticker: str = "") -> float:
     return round(max(ATR_STOP_MIN_PCT, min(ATR_STOP_MAX_PCT, pct)), 3)
 
 
-def _precompute_indicators(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
-    """Pre-calcula RSI, EMA(50) y VWAP intradiario sobre el DataFrame completo.
-    En el backtest se usa iloc[pos] en lugar de recalcular desde cero cada barra.
-    Reduce de O(n²) a O(n) el costo por ticker/timeframe."""
-    out = df.copy()
-    close = df["Close"].squeeze()
-    rsi_period = RSI_PERIODS.get(tf_name, RSI_PERIOD)
-
-    # RSI vectorizado sobre toda la serie
-    delta = close.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-    avg_g = gain.ewm(alpha=1 / rsi_period, adjust=False).mean()
-    avg_l = loss.ewm(alpha=1 / rsi_period, adjust=False).mean()
-    rs    = avg_g / avg_l.replace(0, np.nan)
-    out["_rsi"] = 100 - (100 / (1 + rs))
-
-    if tf_name == "1h":
-        out["_ema50"] = close.ewm(span=EMA_PERIOD, adjust=False).mean()
-
-    if tf_name == "5min" and "Volume" in df.columns:
-        idx      = pd.to_datetime(df.index)
-        typical  = (df["High"] + df["Low"] + df["Close"]) / 3
-        vol      = df["Volume"].astype(float)
-        # VWAP acumulado por día (reset en cada sesión)
-        dates    = idx.date
-        vwap_vals = np.full(len(df), np.nan)
-        for d in np.unique(dates):
-            mask = dates == d
-            v    = vol.values[mask]
-            tp   = typical.values[mask]
-            cum_v  = np.cumsum(v)
-            cum_tp = np.cumsum(tp * v)
-            with np.errstate(invalid="ignore"):
-                vwap_vals[mask] = np.where(cum_v > 0, cum_tp / cum_v, np.nan)
-        out["_vwap"] = vwap_vals
-
-    # Vol ratio: current / avg20 — vectorizado con rolling
-    if "Volume" in df.columns:
-        vol_series = df["Volume"].astype(float)
-        avg20 = vol_series.shift(1).rolling(20, min_periods=5).mean()
-        out["_vol_ratio"] = (vol_series / avg20.replace(0, np.nan)).round(2)
-
-    return out
-
-
-def _analyze_precomputed(df_pre: pd.DataFrame, pos: int, tf_name: str) -> dict | None:
-    """Extrae info de indicadores pre-calculados en la posición `pos`.
-    Reemplaza _analyze_df en el loop del backtest — O(1) por barra."""
-    if pos < RSI_PERIOD + 10:
-        return None
-    rsi_series = df_pre["_rsi"]
-    last_rsi   = float(rsi_series.iloc[pos])
-    if np.isnan(last_rsi):
-        return None
-
-    ob = OVERBOUGHT.get(tf_name, 80)
-    os_ = OVERSOLD.get(tf_name, 20)
-    cond = "overbought" if last_rsi >= ob else "oversold" if last_rsi <= os_ else ""
-
-    close = df_pre["Close"].squeeze()
-    div   = ""
-    if cond:
-        div = detect_divergence(close.iloc[:pos+1], rsi_series.iloc[:pos+1])
-
-    info: dict = {
-        "rsi":       round(last_rsi, 1),
-        "condition": cond,
-        "divergence": div,
-        "vol_ratio": float(df_pre["_vol_ratio"].iloc[pos])
-                     if "_vol_ratio" in df_pre.columns else None,
-        "price":     round(float(close.iloc[pos]), 4),
-    }
-
-    if tf_name == "1h" and "_ema50" in df_pre.columns:
-        ema_val = float(df_pre["_ema50"].iloc[pos])
-        info["above_ema"] = bool(close.iloc[pos] > ema_val) if not np.isnan(ema_val) else None
-
-    if tf_name == "5min" and "_vwap" in df_pre.columns:
-        vwap_val = float(df_pre["_vwap"].iloc[pos])
-        info["above_vwap"] = bool(close.iloc[pos] > vwap_val) if not np.isnan(vwap_val) else None
-
-    return info
-
-
 def _spy_vwap_series(spy_df5: pd.DataFrame, session_date) -> pd.Series:
     """VWAP acumulado del SPY barra a barra para la sesión dada."""
     idx      = pd.to_datetime(spy_df5.index)
@@ -1358,13 +1270,6 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 if (ticker, session_date) in earnings_blocked:
                     continue
 
-                # Pre-calcular indicadores UNA vez por ticker/TF (O(n) total)
-                # en lugar de recalcular RSI/EMA/VWAP desde cero cada barra (O(n²))
-                pre: dict[str, pd.DataFrame] = {
-                    tf_name: _precompute_indicators(df, tf_name)
-                    for tf_name, df in tfs.items()
-                }
-
                 # searchsorted en lugar de máscara booleana para encontrar el día
                 i0 = df5.index.searchsorted(day_start, side="left")
                 i1 = df5.index.searchsorted(day_end,   side="left")
@@ -1375,11 +1280,10 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 prev_sig = ""
                 for ts in session:
                     tf_data: dict = {}
-                    for tf_name, df_pre in pre.items():
-                        pos_tf = df_pre.index.searchsorted(ts, side="right") - 1
-                        if pos_tf < 0:
-                            continue
-                        info = _analyze_precomputed(df_pre, pos_tf, tf_name)
+                    for tf_name, df in tfs.items():
+                        pos_tf = df.index.searchsorted(ts, side="right")
+                        sliced = df.iloc[:pos_tf]
+                        info   = _analyze_df(sliced, tf_name)
                         if info is not None:
                             tf_data[tf_name] = info
                     if len(tf_data) < 3:
@@ -1538,9 +1442,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
             wins = losses = bloqs = 0
             day_roi      = 0.0
             ev_rows: list[tuple] = []
-            circuit_open  = True
-            consec_losses = 0          # pérdidas consecutivas acumuladas
-            pause_until   = None       # hora hasta la que no entramos (freno de racha)
+            circuit_open = True
 
             for ev in sorted(events):
                 hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo = ev
@@ -1550,40 +1452,16 @@ def run_backtest(tickers: list[str], use_demo: bool,
                     bloqs += 1
                     continue
 
-                # Freno de racha: pausa temporal tras CONSEC_LOSS_MAX pérdidas seguidas
-                if sig in ("LONG", "SHORT") and pause_until is not None:
-                    trade_time = datetime.strptime(hora, "%H:%M").replace(
-                        year=session_date.year,
-                        month=session_date.month,
-                        day=session_date.day,
-                    )
-                    if trade_time < pause_until:
-                        bloqs += 1
-                        continue
-                    else:
-                        pause_until = None  # pausa terminada, resetear
-
                 if sig in ("LONG", "SHORT"):
                     roi_eval = roi60 if roi60 is not None else roi30
                     if roi_eval is not None:
                         day_roi += roi_eval
                         if roi_eval >= 0:
                             wins += 1
-                            consec_losses = 0  # racha cortada
                         else:
                             losses += 1
-                            consec_losses += 1
                             loss_records.append(
                                 (session_date, tic, sig, roi_eval, motivo or "?"))
-                            # Activar pausa si alcanzamos el límite de pérdidas consecutivas
-                            if consec_losses >= CONSEC_LOSS_MAX:
-                                trade_time = datetime.strptime(hora, "%H:%M").replace(
-                                    year=session_date.year,
-                                    month=session_date.month,
-                                    day=session_date.day,
-                                )
-                                pause_until   = trade_time + timedelta(minutes=CONSEC_LOSS_PAUSE_M)
-                                consec_losses = 0
                         if day_roi <= CIRCUIT_BREAKER_PCT:
                             circuit_open = False
                     ev_rows.append((hora, tic, sig, px,
