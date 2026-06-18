@@ -1056,6 +1056,84 @@ def _spy_vwap_series(spy_df5: pd.DataFrame, session_date) -> pd.Series:
     return day_bars["_vwap"]
 
 
+def _precompute_indicators(df: pd.DataFrame, tf_name: str) -> pd.DataFrame:
+    """Pre-calcula RSI, EMA(50) y VWAP sobre el DataFrame completo (O(n)).
+    En el backtest se hace lookup por posición en lugar de recalcular cada barra."""
+    out = df.copy()
+    close = df["Close"].squeeze()
+    rsi_period = RSI_PERIODS.get(tf_name, RSI_PERIOD)
+
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(alpha=1 / rsi_period, adjust=False).mean()
+    avg_l = loss.ewm(alpha=1 / rsi_period, adjust=False).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
+    out["_rsi"] = 100 - (100 / (1 + rs))
+
+    if tf_name == "1h":
+        out["_ema50"] = close.ewm(span=EMA_PERIOD, adjust=False).mean()
+
+    if tf_name == "5min" and "Volume" in df.columns:
+        idx      = pd.to_datetime(df.index)
+        typical  = (df["High"] + df["Low"] + df["Close"]) / 3
+        vol      = df["Volume"].astype(float)
+        dates    = idx.date
+        vwap_vals = np.full(len(df), np.nan)
+        for d in np.unique(dates):
+            mask   = dates == d
+            v      = vol.values[mask]
+            tp     = typical.values[mask]
+            cum_v  = np.cumsum(v)
+            cum_tp = np.cumsum(tp * v)
+            with np.errstate(invalid="ignore"):
+                vwap_vals[mask] = np.where(cum_v > 0, cum_tp / cum_v, np.nan)
+        out["_vwap"] = vwap_vals
+
+    if "Volume" in df.columns:
+        vol_s = df["Volume"].astype(float)
+        avg20 = vol_s.shift(1).rolling(20, min_periods=5).mean()
+        out["_vol_ratio"] = (vol_s / avg20.replace(0, np.nan)).round(2)
+
+    return out
+
+
+def _analyze_precomputed(df_pre: pd.DataFrame, pos: int, tf_name: str) -> dict | None:
+    """Lookup O(1) de indicadores pre-calculados en posición `pos`."""
+    if pos < RSI_PERIOD + 10:
+        return None
+    last_rsi = float(df_pre["_rsi"].iloc[pos])
+    if np.isnan(last_rsi):
+        return None
+
+    ob   = OVERBOUGHT.get(tf_name, 80)
+    os_  = OVERSOLD.get(tf_name, 20)
+    cond = "overbought" if last_rsi >= ob else "oversold" if last_rsi <= os_ else ""
+
+    close      = df_pre["Close"].squeeze()
+    rsi_series = df_pre["_rsi"]
+    div        = detect_divergence(close.iloc[:pos+1], rsi_series.iloc[:pos+1]) if cond else ""
+
+    info: dict = {
+        "rsi":        round(last_rsi, 1),
+        "condition":  cond,
+        "divergence": div,
+        "vol_ratio":  float(df_pre["_vol_ratio"].iloc[pos])
+                      if "_vol_ratio" in df_pre.columns else None,
+        "price":      round(float(close.iloc[pos]), 4),
+    }
+
+    if tf_name == "1h" and "_ema50" in df_pre.columns:
+        ema_val = float(df_pre["_ema50"].iloc[pos])
+        info["above_ema"] = bool(close.iloc[pos] > ema_val) if not np.isnan(ema_val) else None
+
+    if tf_name == "5min" and "_vwap" in df_pre.columns:
+        vwap_val = float(df_pre["_vwap"].iloc[pos])
+        info["above_vwap"] = bool(close.iloc[pos] > vwap_val) if not np.isnan(vwap_val) else None
+
+    return info
+
+
 def _spy_vwap_dict(spy_df5: pd.DataFrame | None,
                    session_date) -> tuple[dict, list]:
     """Devuelve (dict {ts: (close, vwap)}, sorted_keys) para lookup O(log n)."""
@@ -1270,6 +1348,12 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 if (ticker, session_date) in earnings_blocked:
                     continue
 
+                # Pre-calcular indicadores una vez por ticker/TF → O(n) total
+                pre: dict[str, pd.DataFrame] = {
+                    tf_name: _precompute_indicators(df, tf_name)
+                    for tf_name, df in tfs.items()
+                }
+
                 # searchsorted en lugar de máscara booleana para encontrar el día
                 i0 = df5.index.searchsorted(day_start, side="left")
                 i1 = df5.index.searchsorted(day_end,   side="left")
@@ -1280,10 +1364,11 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 prev_sig = ""
                 for ts in session:
                     tf_data: dict = {}
-                    for tf_name, df in tfs.items():
-                        pos_tf = df.index.searchsorted(ts, side="right")
-                        sliced = df.iloc[:pos_tf]
-                        info   = _analyze_df(sliced, tf_name)
+                    for tf_name, df_pre in pre.items():
+                        pos_tf = df_pre.index.searchsorted(ts, side="right") - 1
+                        if pos_tf < 0:
+                            continue
+                        info = _analyze_precomputed(df_pre, pos_tf, tf_name)
                         if info is not None:
                             tf_data[tf_name] = info
                     if len(tf_data) < 3:
