@@ -46,8 +46,8 @@ SP500_TICKERS = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","AVGO",
     "JPM","TSLA","UNH","XOM","V","MA","PG","COST","HD","WMT",
     "NFLX","JNJ","ABBV","BAC","KO","CRM","CVX","MRK","AMD","ORCL",
-    "PEP","TMO","ACN","ADBE","MCD","LIN","ABT","DHR","CSCO","WFC",
-    "TXN","NKE","PM","AMGN","NEE","RTX","HON","QCOM","IBM","UNP",
+    "PEP","TMO","ACN","MCD","LIN","ABT","DHR","CSCO","WFC",
+    "TXN","NKE","PM","AMGN","NEE","RTX","HON","IBM","UNP",
     "LOW","SPGI","CAT","GS","MS","AXP","ISRG","INTU","BLK","AMAT",
     "SYK","ELV","MDLZ","ADI","DE","GE","NOW","BKNG","PLD","MMC",
     "TJX","VRTX","CI","CB","SO","DUK","MO","BSX","REGN","ZTS",
@@ -103,7 +103,7 @@ ATR_STOP_MULT_BY_TICKER: dict[str, float] = {
     "NVDA": 2.0, "TSLA": 2.0, "AMD": 1.8,
     # Mid/large caps que sangraban con el default 1.5× (stops gatillados por
     # ruido). Diagnóstico de atribución: STOP = 92% de las pérdidas.
-    "QCOM": 1.8, "ADBE": 1.8, "CSCO": 1.8,
+    "CSCO": 1.8,
     "TXN": 1.8, "GOOG": 1.8, "ABBV": 1.8,
 }
 ATR_STOP_MIN_PCT = 0.20   # stop mínimo (tickers muy tranquilos)
