@@ -95,16 +95,20 @@ VOL_THRESHOLDS: dict[str, float] = {
 }
 VOL_THRESHOLD_DEFAULT = 1.2
 
-# Stop loss base — se ajusta por ATR del ticker en backtest
-STOP_LOSS_PCT    = 0.50   # fallback fijo si ATR no disponible
-ATR_STOP_MULT    = 1.5    # multiplicador ATR por defecto
-# Multiplicador ATR por ticker — los monstruos volátiles necesitan más aire
+# Stop loss base — fijo para la mayoría de tickers
+STOP_LOSS_PCT    = 0.50   # stop fijo para tickers de volatilidad normal
+# Tickers con alta volatilidad intradía → usan ATR dinámico en lugar del fijo
+# Beta alta, semis IA, o historial de swings > 2% intradía frecuentes
+ATR_STOP_MULT    = 1.5    # multiplicador ATR base para los volátiles
 ATR_STOP_MULT_BY_TICKER: dict[str, float] = {
-    "NVDA": 2.0, "TSLA": 2.0, "AMD": 1.8,
-    # Mid/large caps que sangraban con el default 1.5× (stops gatillados por
-    # ruido). Diagnóstico de atribución: STOP = 92% de las pérdidas.
-    "CSCO": 1.8,
-    "TXN": 1.8, "GOOG": 1.8, "ABBV": 1.8,
+    "NVDA": 2.0,   # semis IA, movimientos 2-4% intradía normales
+    "TSLA": 2.0,   # el más volátil del S&P, swings 3-5%
+    "AMD":  1.8,   # semis, similar a NVDA aunque menos extremo
+    "META": 1.8,   # reacciona fuerte a noticias y algoritmos
+    "AMZN": 1.8,   # confirmado: peor stop −0.57% con fijo
+    "NFLX": 1.8,   # alta beta, movimientos bruscos intradía
+    "AVGO": 1.8,   # semis alta cap, volátil
+    "CRM":  1.8,   # software enterprise, reacciona a noticias de sector
 }
 ATR_STOP_MIN_PCT = 0.20   # stop mínimo (tickers muy tranquilos)
 ATR_STOP_MAX_PCT = 1.20   # stop máximo (subido por los multiplicadores altos)
@@ -1422,7 +1426,12 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         if sig in ("LONG", "SHORT"):
                             px            = tf_data["5min"]["price"]
                             pos           = df5.index.get_loc(ts)
-                            stop_pct      = STOP_LOSS_PCT  # fijo 0.50% — test vs ATR dinámico
+                            # Volátiles → ATR dinámico; resto → stop fijo 0.50%
+                            stop_pct = (
+                                _atr_stop_pct(df5, ts, ticker)
+                                if ticker in ATR_STOP_MULT_BY_TICKER
+                                else STOP_LOSS_PCT
+                            )
                             peak          = 0.0
                             exit_roi      = None
                             exit_bar      = None
