@@ -101,6 +101,10 @@ ATR_STOP_MULT    = 1.5    # multiplicador ATR por defecto
 # Multiplicador ATR por ticker — los monstruos volátiles necesitan más aire
 ATR_STOP_MULT_BY_TICKER: dict[str, float] = {
     "NVDA": 2.0, "TSLA": 2.0, "AMD": 1.8,
+    # Mid/large caps que sangraban con el default 1.5× (stops gatillados por
+    # ruido). Diagnóstico de atribución: STOP = 92% de las pérdidas.
+    "QCOM": 1.8, "ADBE": 1.8, "CSCO": 1.8,
+    "TXN": 1.8, "GOOG": 1.8, "ABBV": 1.8,
 }
 ATR_STOP_MIN_PCT = 0.20   # stop mínimo (tickers muy tranquilos)
 ATR_STOP_MAX_PCT = 1.20   # stop máximo (subido por los multiplicadores altos)
@@ -118,6 +122,10 @@ RSI_1H_LONG_MIN  = 60   # antes 55 — solo LONG cuando la tendencia hourly es c
 RSI_1H_SHORT_MAX = 40   # antes 45 — solo SHORT cuando la tendencia hourly es clara
 # Régimen de mercado — se filtra usando el rango del SPY en la 1ª hora
 REGIME_RANGE_MIN = 0.45   # mejor resultado en backtest: +8.04% ROI vs +6.40% con 0.50%
+# Filtro direccional del régimen: si el SPY en la 1ª hora se movió neto
+# >= este % en una dirección, bloqueamos las señales contra ese sesgo macro
+# (SPY cayendo → no LONG; SPY subiendo → no SHORT). Evita pelear contra la cinta.
+SPY_DIR_MIN_PCT = 0.20
 # Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
 CIRCUIT_BREAKER_PCT = -1.5
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
@@ -1084,6 +1092,28 @@ def _spy_regime(spy_df5: pd.DataFrame | None, session_date) -> bool:
     return rng_pct >= REGIME_RANGE_MIN
 
 
+def _spy_direction(spy_df5: pd.DataFrame | None, session_date) -> str:
+    """Sesgo direccional del SPY en la 1ª hora (9:30-10:30 ET).
+    Retorna "up" / "down" / "" (neutral). Movimiento neto = cierre 10:30
+    vs apertura 9:30. Sirve para no operar contra la cinta macro."""
+    if spy_df5 is None:
+        return ""
+    day_bars = spy_df5[
+        (pd.to_datetime(spy_df5.index).date == session_date) &
+        (pd.to_datetime(spy_df5.index).hour.isin([9, 10]))
+    ]
+    if len(day_bars) < 4:
+        return ""
+    open_px  = float(day_bars["Open"].iloc[0])
+    close_px = float(day_bars["Close"].iloc[-1])
+    net_pct  = (close_px - open_px) / open_px * 100
+    if net_pct >= SPY_DIR_MIN_PCT:
+        return "up"
+    if net_pct <= -SPY_DIR_MIN_PCT:
+        return "down"
+    return ""
+
+
 def _build_earnings_set(tickers: list[str]) -> set[tuple]:
     """Descarga calendario de earnings de yfinance.
     Retorna set de (ticker, date) donde NO se debe operar
@@ -1221,6 +1251,8 @@ def run_backtest(tickers: list[str], use_demo: bool,
 
             # VWAP del SPY precalculado para lookup O(log n) en el loop
             spy_vwap_d, spy_vwap_keys = _spy_vwap_dict(spy_df5, session_date)
+            # Sesgo direccional macro del día (opción B): no operar contra la cinta
+            spy_dir = _spy_direction(spy_df5, session_date)
 
             events: list[tuple] = []
 
@@ -1264,6 +1296,15 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         (sig != prev_sig and sig in ("LONG", "SHORT")) or
                         (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
                     ):
+                        # ── Filtro direccional macro (Opción B) ──
+                        # No pelear contra la cinta: SPY cayendo bloquea LONG,
+                        # SPY subiendo bloquea SHORT. Ataca los días rojos
+                        # marcados "OK" por el filtro de rango (06-12, 06-16…).
+                        if ((sig == "LONG"  and spy_dir == "down") or
+                                (sig == "SHORT" and spy_dir == "up")):
+                            prev_sig = sig
+                            continue
+
                         # ── Filtro VWAP SPY (Opción A — banda muerta) ──
                         # Solo bloquea si el SPY está claramente lejos del VWAP.
                         # Pegado al VWAP (±SPY_VWAP_BAND_PCT) no filtra: día indeciso,
