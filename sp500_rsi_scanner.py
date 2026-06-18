@@ -128,9 +128,8 @@ REGIME_RANGE_MIN = 0.45   # mejor resultado en backtest: +8.04% ROI vs +6.40% co
 SPY_DIR_MIN_PCT = 0.20
 # Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
 CIRCUIT_BREAKER_PCT = -1.5
-# Freno de racha: tras N pérdidas consecutivas, pausa M minutos antes de volver a entrar
-CONSEC_LOSS_MAX     = 2
-CONSEC_LOSS_PAUSE_M = 30
+# Circuit breaker por conteo: tras N pérdidas en el día, se cierra el día entero
+MAX_DAILY_LOSSES = 3
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
 EARNINGS_FILTER = False
 
@@ -1528,32 +1527,17 @@ def run_backtest(tickers: list[str], use_demo: bool,
             # Classify events en orden cronológico:
             # circuit breaker -1.5% acumulado → cerrar día
             wins = losses = bloqs = 0
-            day_roi       = 0.0
+            day_roi      = 0.0
             ev_rows: list[tuple] = []
-            circuit_open  = True
-            consec_losses = 0
-            pause_until   = None
+            circuit_open = True
 
             for ev in sorted(events):
                 hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo = ev
 
-                # Circuit breaker activo: no más trades el resto del día
+                # Circuit breaker activo (ROI o conteo de pérdidas): cierra el día
                 if sig in ("LONG", "SHORT") and not circuit_open:
                     bloqs += 1
                     continue
-
-                # Freno de racha: pausa temporal tras CONSEC_LOSS_MAX pérdidas seguidas
-                if sig in ("LONG", "SHORT") and pause_until is not None:
-                    trade_time = datetime.strptime(hora, "%H:%M").replace(
-                        year=session_date.year,
-                        month=session_date.month,
-                        day=session_date.day,
-                    )
-                    if trade_time < pause_until:
-                        bloqs += 1
-                        continue
-                    else:
-                        pause_until = None
 
                 if sig in ("LONG", "SHORT"):
                     roi_eval = roi60 if roi60 is not None else roi30
@@ -1561,21 +1545,14 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         day_roi += roi_eval
                         if roi_eval >= 0:
                             wins += 1
-                            consec_losses = 0
                         else:
                             losses += 1
-                            consec_losses += 1
                             loss_records.append(
                                 (session_date, tic, sig, roi_eval, motivo or "?"))
-                            if consec_losses >= CONSEC_LOSS_MAX:
-                                trade_time = datetime.strptime(hora, "%H:%M").replace(
-                                    year=session_date.year,
-                                    month=session_date.month,
-                                    day=session_date.day,
-                                )
-                                pause_until   = trade_time + timedelta(minutes=CONSEC_LOSS_PAUSE_M)
-                                consec_losses = 0
-                        if day_roi <= CIRCUIT_BREAKER_PCT:
+                        # Cierra el día si ROI acumulado toca el límite
+                        # O si acumulamos demasiadas pérdidas individuales
+                        if (day_roi <= CIRCUIT_BREAKER_PCT or
+                                losses >= MAX_DAILY_LOSSES):
                             circuit_open = False
                     ev_rows.append((hora, tic, sig, px,
                                     roi30, roi60, r5, r15, r1h, motivo))
