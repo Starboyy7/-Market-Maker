@@ -1422,7 +1422,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         if sig in ("LONG", "SHORT"):
                             px            = tf_data["5min"]["price"]
                             pos           = df5.index.get_loc(ts)
-                            stop_pct      = _atr_stop_pct(df5, ts, ticker)
+                            stop_pct      = STOP_LOSS_PCT  # fijo 0.50% — test vs ATR dinámico
                             peak          = 0.0
                             exit_roi      = None
                             exit_bar      = None
