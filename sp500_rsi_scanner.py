@@ -118,8 +118,10 @@ TRAIL_STOP_PCT       = 0.25
 # solo bloquea si el SPY está claramente lejos del VWAP. Pegado al VWAP no filtra.
 SPY_VWAP_BAND_PCT = 0.15
 # Umbral del RSI 1H para confirmar tendencia mayor (más estricto = señal más limpia)
-RSI_1H_LONG_MIN  = 60   # antes 55 — solo LONG cuando la tendencia hourly es clara
-RSI_1H_SHORT_MAX = 40   # antes 45 — solo SHORT cuando la tendencia hourly es clara
+RSI_1H_LONG_MIN  = 60   # LONG válido: RSI 1H > 60 (alcista claro)
+RSI_1H_LONG_MAX  = 75   # LONG bloqueado: RSI 1H > 75 (overbought extremo, rebote agotado)
+RSI_1H_SHORT_MAX = 40   # SHORT válido: RSI 1H < 40 (bajista claro)
+RSI_1H_SHORT_MIN = 25   # SHORT bloqueado: RSI 1H < 25 (oversold extremo, ya cayó demasiado)
 # Régimen de mercado — se filtra usando el rango del SPY en la 1ª hora
 REGIME_RANGE_MIN = 0.45   # mejor resultado en backtest: +8.04% ROI vs +6.40% con 0.50%
 # Filtro direccional del régimen: si el SPY en la 1ª hora se movió neto
@@ -302,7 +304,8 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
     rsi_15m_pre = d15_pre.get("rsi", 50)
     rsi_5m_pre  = d5_pre.get("rsi", 50)
     # Tentative direction: LONG bias if 1H bullish, SHORT bias if bearish
-    bias = "long" if rsi_1h_pre > RSI_1H_LONG_MIN else "short" if rsi_1h_pre < RSI_1H_SHORT_MAX else ""
+    bias = ("long"  if RSI_1H_LONG_MIN  < rsi_1h_pre <= RSI_1H_LONG_MAX  else
+            "short" if RSI_1H_SHORT_MIN <= rsi_1h_pre <  RSI_1H_SHORT_MAX else "")
 
     # BLOQ: only block when divergence is CONTRARY to the trade direction
     for info in tf_data.values():
@@ -348,13 +351,13 @@ def calc_alignment(ticker: str, tf_data: dict) -> Text:
     in_short_reversal = 65 <= rsi_5m <= 80
 
     t = Text()
-    if (rsi_1h > RSI_1H_LONG_MIN and long_dir and rsi_15m > 50
+    if (RSI_1H_LONG_MIN < rsi_1h <= RSI_1H_LONG_MAX and long_dir and rsi_15m > 50
             and in_long_reversal and vol_ok):
         if _market_tradeable():
             t.append("LONG", style="bold green")
         else:
             t.append("ESPERAR", style="dim")
-    elif (rsi_1h < RSI_1H_SHORT_MAX and short_dir and rsi_15m < 50
+    elif (RSI_1H_SHORT_MIN <= rsi_1h < RSI_1H_SHORT_MAX and short_dir and rsi_15m < 50
             and in_short_reversal and vol_ok):
         if _market_tradeable():
             t.append("SHORT", style="bold red")
