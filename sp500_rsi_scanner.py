@@ -1711,8 +1711,8 @@ def _print_month_summary(day_summary: list[tuple]):
         f"Promedio/día activo: [cyan]{avg_day}[/cyan]  "
         f"[dim]Días choppy filtrados: {choppy_days}[/dim]  "
         f"│  Capital inicial: [cyan]${CAPITAL_INITIAL:.0f}[/cyan]  "
-        f"Capital final: [bold {'green' if net_pnl >= 0 else 'red'}]${final_cap:.2f}[/bold]  "
-        f"P&L neto: [bold {'green' if net_pnl >= 0 else 'red'}]${net_pnl:+.2f}[/bold]\n"
+        f"Capital final: [bold {'green' if net_pnl >= 0 else 'red'}]${final_cap:.2f}[/]  "
+        f"P&L neto: [bold {'green' if net_pnl >= 0 else 'red'}]${net_pnl:+.2f}[/]\n"
     )
     _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi)
 
