@@ -141,8 +141,9 @@ CACHE_DIR = Path("cache")
 CACHE_MAX_AGE_HOURS = 4   # durante el día, refresca cada 4h como máximo
 
 # Trading hours filter (ET) — no signals outside this window
-TRADE_START = (9, 50)   # ignore first 20 min of session (noise)
-TRADE_END   = (15, 30)  # no new entries in last 30 min
+TRADE_START  = (9, 50)   # ignore first 20 min of session (noise)
+TRADE_END    = (15, 30)  # forced close time (trailing stop exits here)
+ENTRY_CUTOFF = (14, 15)  # no new entries after this time (Opción 2)
 
 LOG_FILE = Path("signal_log.csv")
 LOG_FIELDS = [
@@ -1382,7 +1383,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                     sig   = calc_alignment(ticker, tf_data).plain
                     ts_dt = pd.to_datetime(ts)
                     hm_ts = (ts_dt.hour, ts_dt.minute)
-                    in_window = all_hours or (TRADE_START <= hm_ts < TRADE_END)
+                    in_window = all_hours or (TRADE_START <= hm_ts < ENTRY_CUTOFF)
                     if in_window and (
                         (sig != prev_sig and sig in ("LONG", "SHORT")) or
                         (sig.startswith("BLOQ") and not prev_sig.startswith("BLOQ"))
