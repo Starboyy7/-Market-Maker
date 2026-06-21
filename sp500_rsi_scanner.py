@@ -1550,12 +1550,18 @@ def run_backtest(tickers: list[str], use_demo: bool,
             day_roi      = 0.0
             ev_rows: list[tuple] = []
             circuit_open = True
+            stopped_tickers: set[str] = set()  # tickers que ya tocaron stop hoy
 
             for ev in sorted(events):
                 hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo, exit_hora = ev
 
                 # Circuit breaker activo (ROI o conteo de pérdidas): cierra el día
                 if sig in ("LONG", "SHORT") and not circuit_open:
+                    bloqs += 1
+                    continue
+
+                # Opción 3: si este ticker ya tocó stop hoy, no volver a entrar
+                if sig in ("LONG", "SHORT") and tic in stopped_tickers:
                     bloqs += 1
                     continue
 
@@ -1569,6 +1575,8 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             losses += 1
                             loss_records.append(
                                 (session_date, tic, sig, roi_eval, motivo or "?"))
+                            if motivo == "STOP":
+                                stopped_tickers.add(tic)
                         all_trades.append((session_date, hora, exit_hora, tic, roi_eval))
                         if day_roi <= CIRCUIT_BREAKER_PCT:
                             circuit_open = False
