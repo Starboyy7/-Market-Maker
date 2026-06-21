@@ -1425,7 +1425,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                         #   TP    = 50% sale en +0.40%
                         #   resto = trailing stop hasta TRADE_END (15:30 ET) — sin
                         #           gaps overnight. roi60 = ROI realizado del trade.
-                        roi30 = roi60 = None
+                        roi30 = roi60 = exit_ts = None
                         if sig in ("LONG", "SHORT"):
                             px            = tf_data["5min"]["price"]
                             pos           = df5.index.get_loc(ts)
@@ -1535,7 +1535,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             tf_data.get("15min", {}).get("rsi", ""),
                             tf_data.get("1h", {}).get("rsi", ""),
                             exit_reason if sig in ("LONG", "SHORT") else "",
-                            exit_ts,  # hora de cierre para rastrear posiciones simultáneas
+                            exit_ts if sig in ("LONG", "SHORT") else None,
                         ))
                     prev_sig = sig
 
