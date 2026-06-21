@@ -1322,7 +1322,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
     day_summary: list[tuple] = []   # (date, wins, losses, bloqs, roi, skipped_regime)
     # Atribución de pérdidas: (date, ticker, sig, roi, motivo_salida)
     loss_records: list[tuple] = []
-    # Todos los trades: (date, hora, ticker, roi) — para análisis de rachas
+    # Todos los trades: (date, hora_entrada, hora_salida, ticker, roi) — para análisis de rachas
     all_trades: list[tuple] = []
 
     _FORCE_OPEN = True
@@ -1522,6 +1522,16 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                     ) if half_exit_roi is not None else time_exit
                                     exit_reason = "TIEMPO"
 
+                        # Compute exit time for streak display
+                        if sig in ("LONG", "SHORT"):
+                            if exit_bar is not None:
+                                exit_idx = pos + exit_bar
+                            else:
+                                exit_idx = min(pos + 12, len(df5.index) - 1)
+                            exit_hora = pd.to_datetime(df5.index[exit_idx]).strftime("%H:%M")
+                        else:
+                            exit_hora = None
+
                         events.append((
                             ts_dt.strftime("%H:%M"), ticker, sig,
                             tf_data["5min"]["price"],
@@ -1530,6 +1540,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             tf_data.get("15min", {}).get("rsi", ""),
                             tf_data.get("1h", {}).get("rsi", ""),
                             exit_reason if sig in ("LONG", "SHORT") else "",
+                            exit_hora,
                         ))
                     prev_sig = sig
 
@@ -1541,7 +1552,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
             circuit_open = True
 
             for ev in sorted(events):
-                hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo = ev
+                hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo, exit_hora = ev
 
                 # Circuit breaker activo (ROI o conteo de pérdidas): cierra el día
                 if sig in ("LONG", "SHORT") and not circuit_open:
@@ -1558,7 +1569,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             losses += 1
                             loss_records.append(
                                 (session_date, tic, sig, roi_eval, motivo or "?"))
-                        all_trades.append((session_date, hora, tic, roi_eval))
+                        all_trades.append((session_date, hora, exit_hora, tic, roi_eval))
                         if day_roi <= CIRCUIT_BREAKER_PCT:
                             circuit_open = False
                     ev_rows.append((hora, tic, sig, px,
@@ -1763,24 +1774,25 @@ def _print_loss_attribution(day_summary, loss_records, all_trades):
             rt.add_column(col, justify="center")
 
         for date in sorted(neg_dates):
-            day_t = [(h, tk, r) for d, h, tk, r in all_trades if d == date]
+            day_t = [(h, hx, tk, r) for d, h, hx, tk, r in all_trades if d == date]
             if not day_t:
                 continue
             # Calcular racha máxima de pérdidas consecutivas
             max_streak = cur_streak = 0
             winners = losers = 0
             seq_parts = []
-            for _, tk, r in day_t:
+            for h, hx, tk, r in day_t:
+                time_str = f"[dim]{h}→{hx}[/dim] {tk} "
                 if r >= 0:
                     winners += 1
                     cur_streak = 0
-                    seq_parts.append(f"[green]+{r:.2f}%[/green]")
+                    seq_parts.append(f"{time_str}[green]+{r:.2f}%[/green]")
                 else:
                     losers += 1
                     cur_streak += 1
                     max_streak = max(max_streak, cur_streak)
-                    seq_parts.append(f"[red]{r:.2f}%[/red]")
-            seq_str = " → ".join(seq_parts)
+                    seq_parts.append(f"{time_str}[red]{r:.2f}%[/red]")
+            seq_str = "\n→ ".join(seq_parts)
             rt.add_row(
                 str(date),
                 seq_str,
