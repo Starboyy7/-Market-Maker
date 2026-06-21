@@ -132,6 +132,9 @@ REGIME_RANGE_MIN = 0.45   # mejor resultado en backtest: +8.04% ROI vs +6.40% co
 SPY_DIR_MIN_PCT = 0.20
 # Circuit breaker diario: si el ROI acumulado del día llega a este nivel, no más trades
 CIRCUIT_BREAKER_PCT = -1.5
+# Máximo de posiciones abiertas simultáneamente en el día
+# Evita concentración en días malos y limita exposición total
+MAX_OPEN_POSITIONS = 5
 # Filtro de earnings — no operar el día del reporte ni 1 día antes
 EARNINGS_FILTER = False
 
@@ -1503,6 +1506,10 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                 if bar_n == 6:
                                     roi30 = round(close_roi, 2)
 
+                            # Calcular hora de salida para rastrear posiciones abiertas
+                            exit_pos = (pos + exit_bar) if exit_bar is not None else min(pos + 12, i1 - 1)
+                            exit_ts  = pd.to_datetime(df5.index[exit_pos]) if exit_pos < len(df5.index) else None
+
                             if exit_roi is not None:
                                 if exit_bar is not None and exit_bar <= 6:
                                     roi30 = exit_roi
@@ -1528,6 +1535,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             tf_data.get("15min", {}).get("rsi", ""),
                             tf_data.get("1h", {}).get("rsi", ""),
                             exit_reason if sig in ("LONG", "SHORT") else "",
+                            exit_ts,  # hora de cierre para rastrear posiciones simultáneas
                         ))
                     prev_sig = sig
 
@@ -1536,17 +1544,31 @@ def run_backtest(tickers: list[str], use_demo: bool,
             wins = losses = bloqs = 0
             day_roi      = 0.0
             ev_rows: list[tuple] = []
-            circuit_open = True
+            circuit_open  = True
+            open_positions: list = []  # horas de cierre de posiciones activas
 
             for ev in sorted(events):
-                hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo = ev
+                hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo, exit_ts = ev
 
-                # Circuit breaker activo (ROI o conteo de pérdidas): cierra el día
+                # Circuit breaker activo: cierra el día
                 if sig in ("LONG", "SHORT") and not circuit_open:
                     bloqs += 1
                     continue
 
                 if sig in ("LONG", "SHORT"):
+                    # Limpiar posiciones que ya cerraron
+                    trade_dt = datetime.strptime(hora, "%H:%M").replace(
+                        year=session_date.year,
+                        month=session_date.month,
+                        day=session_date.day,
+                    )
+                    open_positions = [t for t in open_positions if t > trade_dt]
+
+                    # Límite de posiciones simultáneas
+                    if len(open_positions) >= MAX_OPEN_POSITIONS:
+                        bloqs += 1
+                        continue
+
                     roi_eval = roi60 if roi60 is not None else roi30
                     if roi_eval is not None:
                         day_roi += roi_eval
@@ -1558,6 +1580,14 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                 (session_date, tic, sig, roi_eval, motivo or "?"))
                         if day_roi <= CIRCUIT_BREAKER_PCT:
                             circuit_open = False
+
+                    if exit_ts is not None:
+                        exit_dt = pd.to_datetime(exit_ts)
+                        open_positions.append(
+                            exit_dt.replace(tzinfo=None)
+                            if hasattr(exit_dt, "tzinfo") else exit_dt
+                        )
+
                     ev_rows.append((hora, tic, sig, px,
                                     roi30, roi60, r5, r15, r1h, motivo))
                 else:
