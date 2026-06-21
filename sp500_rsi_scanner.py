@@ -1502,14 +1502,6 @@ def run_backtest(tickers: list[str], use_demo: bool,
                                     exit_reason = "FORZADO"
                                     break
 
-                                # Opción 1: salida por inactividad —
-                                # si a los 45 min el pico favorable < +0.15%, cortar
-                                if bar_n == 9 and peak < 0.15 and half_exit_roi is None:
-                                    exit_roi   = round(close_roi, 2)
-                                    exit_bar   = bar_n
-                                    exit_reason = "INACTIVO"
-                                    break
-
                                 if bar_n == 6:
                                     roi30 = round(close_roi, 2)
 
