@@ -144,6 +144,11 @@ CACHE_MAX_AGE_HOURS = 4   # durante el día, refresca cada 4h como máximo
 TRADE_START = (9, 50)   # ignore first 20 min of session (noise)
 TRADE_END   = (15, 30)  # no new entries in last 30 min
 
+# Capital simulation
+CAPITAL_INITIAL = 1_000.0   # USD starting capital
+POSITION_PCT    = 0.20       # fraction of capital per trade
+SPREAD_PCT      = 0.04       # round-trip bid/ask spread cost (%)
+
 LOG_FILE = Path("signal_log.csv")
 LOG_FIELDS = [
     "timestamp", "ticker", "señal", "market_open",
@@ -1324,13 +1329,15 @@ def run_backtest(tickers: list[str], use_demo: bool,
     loss_records: list[tuple] = []
     # Todos los trades: (date, hora_entrada, hora_salida, ticker, roi) — para análisis de rachas
     all_trades: list[tuple] = []
+    capital = CAPITAL_INITIAL      # running capital, compounds across days
 
     _FORCE_OPEN = True
     try:
         for session_date in session_days:
             # ── Rec 1: Filtro de régimen (umbral subido a 0.55%) ─────────────
             if not _spy_regime(spy_df5, session_date):
-                day_summary.append((session_date, 0, 0, 0, 0.0, "—", True))
+                day_summary.append((session_date, 0, 0, 0, 0.0, "—", True,
+                                    0.0, round(capital, 2)))
                 continue
 
             # VWAP del SPY precalculado para lookup O(log n) en el loop
@@ -1551,6 +1558,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
             ev_rows: list[tuple] = []
             circuit_open = True
             stopped_tickers: set[str] = set()  # tickers que ya tocaron stop hoy
+            day_pnl_usd = 0.0
 
             for ev in sorted(events):
                 hora, tic, sig, px, roi30, roi60, r5, r15, r1h, motivo, exit_hora = ev
@@ -1568,7 +1576,13 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 if sig in ("LONG", "SHORT"):
                     roi_eval = roi60 if roi60 is not None else roi30
                     if roi_eval is not None:
+                        # Deduct spread cost from ROI (round-trip bid/ask)
+                        roi_net = roi_eval - SPREAD_PCT
+                        position_usd = capital * POSITION_PCT
+                        pnl_usd = position_usd * roi_net / 100
+                        capital += pnl_usd
                         day_roi += roi_eval
+                        day_pnl_usd = day_pnl_usd + pnl_usd
                         if roi_eval >= 0:
                             wins += 1
                         else:
@@ -1593,7 +1607,8 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 traded = wins + losses
                 wr = f"{wins/traded*100:.0f}%" if traded else "—"
                 day_summary.append((session_date, wins, losses, bloqs,
-                                    round(day_roi, 2), wr, False))
+                                    round(day_roi, 2), wr, False,
+                                    round(day_pnl_usd, 2), round(capital, 2)))
     finally:
         _FORCE_OPEN = False
 
@@ -1645,7 +1660,7 @@ def _print_month_summary(day_summary: list[tuple]):
         box=box.SIMPLE_HEAD,
     )
     for col in ("Fecha", "Trades", "W", "L",
-                "Win rate", "ROI@60m día", "ROI@60m acum", "Régimen"):
+                "Win rate", "ROI@60m día", "ROI@60m acum", "P&L día $", "Capital $", "Régimen"):
         table.add_column(col, justify="center")
 
     cum_roi = 0.0
@@ -1654,6 +1669,8 @@ def _print_month_summary(day_summary: list[tuple]):
     for row in day_summary:
         date, wins, losses, bloqs, day_roi, wr = row[:6]
         choppy = row[6] if len(row) > 6 else False
+        day_pnl = row[7] if len(row) > 7 else 0.0
+        cap_eod  = row[8] if len(row) > 8 else CAPITAL_INITIAL
         cum_roi += day_roi
         total_w += wins
         total_l += losses
@@ -1664,6 +1681,8 @@ def _print_month_summary(day_summary: list[tuple]):
         roi_style = "bold green" if day_roi >= 0 else "bold red"
         cum_style = "bold green" if cum_roi >= 0 else "bold red"
         regime_label = Text("CHOPPY", style="dim") if choppy else Text("OK", style="dim green")
+        pnl_style = "bold green" if day_pnl >= 0 else "bold red"
+        cap_style  = "bold green" if cap_eod >= CAPITAL_INITIAL else "bold red"
         table.add_row(
             str(date),
             str(traded),
@@ -1671,6 +1690,8 @@ def _print_month_summary(day_summary: list[tuple]):
             wr,
             Text(f"{day_roi:+.2f}%", style=roi_style),
             Text(f"{cum_roi:+.2f}%", style=cum_style),
+            Text(f"${day_pnl:+.2f}", style=pnl_style),
+            Text(f"${cap_eod:.2f}", style=cap_style),
             regime_label,
         )
 
@@ -1679,13 +1700,19 @@ def _print_month_summary(day_summary: list[tuple]):
     active_days  = len(day_summary) - choppy_days
     global_wr    = f"{total_w/total_traded*100:.0f}%" if total_traded else "—"
     avg_day      = f"{cum_roi/active_days:+.2f}%" if active_days else "—"
+    # Final capital is in last row's cap_eod
+    final_cap = day_summary[-1][8] if day_summary and len(day_summary[-1]) > 8 else CAPITAL_INITIAL
+    net_pnl   = final_cap - CAPITAL_INITIAL
     console.print(
         f"\n[bold]TOTAL:[/bold]  {total_traded} trades  "
         f"[green]{total_w}W[/green] [red]{total_l}L[/red]  "
         f"│  Win rate global: [cyan]{global_wr}[/cyan]  "
         f"ROI acumulado: [cyan]{cum_roi:+.2f}%[/cyan]  "
         f"Promedio/día activo: [cyan]{avg_day}[/cyan]  "
-        f"[dim]Días choppy filtrados: {choppy_days}[/dim]\n"
+        f"[dim]Días choppy filtrados: {choppy_days}[/dim]  "
+        f"│  Capital inicial: [cyan]${CAPITAL_INITIAL:.0f}[/cyan]  "
+        f"Capital final: [bold {'green' if net_pnl >= 0 else 'red'}]${final_cap:.2f}[/bold]  "
+        f"P&L neto: [bold {'green' if net_pnl >= 0 else 'red'}]${net_pnl:+.2f}[/bold]\n"
     )
     _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi)
 
