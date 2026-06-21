@@ -1322,6 +1322,8 @@ def run_backtest(tickers: list[str], use_demo: bool,
     day_summary: list[tuple] = []   # (date, wins, losses, bloqs, roi, skipped_regime)
     # Atribución de pérdidas: (date, ticker, sig, roi, motivo_salida)
     loss_records: list[tuple] = []
+    # Todos los trades: (date, hora, ticker, roi) — para análisis de rachas
+    all_trades: list[tuple] = []
 
     _FORCE_OPEN = True
     try:
@@ -1556,6 +1558,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
                             losses += 1
                             loss_records.append(
                                 (session_date, tic, sig, roi_eval, motivo or "?"))
+                        all_trades.append((session_date, hora, tic, roi_eval))
                         if day_roi <= CIRCUIT_BREAKER_PCT:
                             circuit_open = False
                     ev_rows.append((hora, tic, sig, px,
@@ -1577,7 +1580,7 @@ def run_backtest(tickers: list[str], use_demo: bool,
 
     if days > 1:
         _print_month_summary(day_summary)
-        _print_loss_attribution(day_summary, loss_records)
+        _print_loss_attribution(day_summary, loss_records, all_trades)
 
 
 def _print_day_table(session_date, ev_rows, wins, losses, bloqs, day_roi):
@@ -1668,7 +1671,7 @@ def _print_month_summary(day_summary: list[tuple]):
     _trader_advice_monthly(day_summary, total_w, total_l, total_b, cum_roi)
 
 
-def _print_loss_attribution(day_summary, loss_records):
+def _print_loss_attribution(day_summary, loss_records, all_trades):
     """Diagnóstico: ¿de dónde vienen las pérdidas?
     Desglosa los días negativos, el ticker que más sangró y el motivo de
     salida (STOP / TRAIL / FORZADO / TIEMPO) para detectar patrones."""
@@ -1748,6 +1751,44 @@ def _print_loss_attribution(day_summary, loss_records):
                 str(tick_count[tic]),
             )
         console.print(st)
+
+    # ── Análisis de rachas en días negativos ──────────────────────────────────
+    neg_dates = {r[0] for r in day_summary if len(r) > 4 and r[4] < 0}
+    if neg_dates and all_trades:
+        rt = Table(
+            title="[bold yellow]Rachas en días negativos[/bold yellow]",
+            box=box.SIMPLE_HEAD,
+        )
+        for col in ("Fecha", "Secuencia de trades", "Max racha −", "Ganadores", "Perdedores"):
+            rt.add_column(col, justify="center")
+
+        for date in sorted(neg_dates):
+            day_t = [(h, tk, r) for d, h, tk, r in all_trades if d == date]
+            if not day_t:
+                continue
+            # Calcular racha máxima de pérdidas consecutivas
+            max_streak = cur_streak = 0
+            winners = losers = 0
+            seq_parts = []
+            for _, tk, r in day_t:
+                if r >= 0:
+                    winners += 1
+                    cur_streak = 0
+                    seq_parts.append(f"[green]+{r:.2f}%[/green]")
+                else:
+                    losers += 1
+                    cur_streak += 1
+                    max_streak = max(max_streak, cur_streak)
+                    seq_parts.append(f"[red]{r:.2f}%[/red]")
+            seq_str = " → ".join(seq_parts)
+            rt.add_row(
+                str(date),
+                seq_str,
+                Text(str(max_streak), style="bold red"),
+                Text(str(winners), style="green"),
+                Text(str(losers), style="red"),
+            )
+        console.print(rt)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
