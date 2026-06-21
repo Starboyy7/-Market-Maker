@@ -146,7 +146,7 @@ TRADE_END   = (15, 30)  # no new entries in last 30 min
 
 # Capital simulation
 CAPITAL_INITIAL = 1_000.0   # USD starting capital
-POSITION_PCT    = 0.20       # fraction of capital per trade
+POSITION_PCT    = 0.30       # fraction of capital per trade
 SPREAD_PCT      = 0.04       # round-trip bid/ask spread cost (%)
 
 LOG_FILE = Path("signal_log.csv")
