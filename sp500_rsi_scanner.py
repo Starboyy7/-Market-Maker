@@ -1782,7 +1782,7 @@ def _print_loss_attribution(day_summary, loss_records, all_trades):
             winners = losers = 0
             seq_parts = []
             for h, hx, tk, r in day_t:
-                time_str = f"[dim]{h}→{hx}[/dim] {tk} "
+                time_str = f"[cyan]{h}→{hx}[/cyan] [bold white]{tk}[/bold white] "
                 if r >= 0:
                     winners += 1
                     cur_streak = 0
