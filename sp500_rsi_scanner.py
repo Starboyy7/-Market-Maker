@@ -148,6 +148,7 @@ TRADE_END   = (15, 30)  # no new entries in last 30 min
 CAPITAL_INITIAL = 1_000.0   # USD starting capital
 POSITION_PCT    = 0.30       # fraction of capital per trade
 SPREAD_PCT      = 0.04       # round-trip bid/ask spread cost (%)
+SLIPPAGE_PCT    = 0.05       # round-trip slippage + latency cost (%)
 
 LOG_FILE = Path("signal_log.csv")
 LOG_FIELDS = [
@@ -1576,8 +1577,8 @@ def run_backtest(tickers: list[str], use_demo: bool,
                 if sig in ("LONG", "SHORT"):
                     roi_eval = roi60 if roi60 is not None else roi30
                     if roi_eval is not None:
-                        # Deduct spread cost from ROI (round-trip bid/ask)
-                        roi_net = roi_eval - SPREAD_PCT
+                        # Deduct spread + slippage/latency from ROI
+                        roi_net = roi_eval - SPREAD_PCT - SLIPPAGE_PCT
                         position_usd = capital * POSITION_PCT
                         pnl_usd = position_usd * roi_net / 100
                         capital += pnl_usd
